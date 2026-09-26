@@ -114,9 +114,14 @@ OpenAICompatProvider(
     model: str,
     api_key: str | None,
     *,
+    persona_dir: Path | None = None,  # images dir + usage log
     transport: httpx.BaseTransport | None = None,  # test seam
 )
 ```
+
+The factory always passes `persona_dir`, so every call is usage-logged,
+including background `generate()` calls, which carry no `options`.
+*(Amended during planning.)*
 
 Each call opens a short-lived `httpx.Client(transport=transport, trust_env=False)`
 — matching the relay client's `trust_env=False` so a stray proxy env var can't
@@ -155,28 +160,33 @@ The provider never dispatches tools. Tool calls are returned to
 5. **Tool results** → `{"role": "tool", "tool_call_id", "content"}`.
 6. **Images.**
    - A tool-result message whose JSON content has an `image` object (the
-     `read_file` image payload: base64 `data` + `media_type`) is rewritten: the
-     `image.data` field is removed from the tool text and replaced with
+     `read_file` image payload: base64 `data_b64` + `media_type`) is rewritten:
+     the whole `image` object is replaced in the tool text with
      `"image": "[attached below]"` (vision on) or
      `"image": "[image not viewable with this model]"` (vision off).
    - With `vision: true`, a `user` message follows the tool results of that
      turn, carrying one `image_url` part per image:
-     `{"type": "image_url", "image_url": {"url": "data:<media_type>;base64,<data>"}}`.
+     `{"type": "image_url", "image_url": {"url": "data:<media_type>;base64,<data_b64>"}}`.
    - Any `ImageBlock` in the history is handled the same way, with bytes read
-     from `<persona_dir>/images/<sha>.<ext>` (`options["persona_dir"]`). If the
-     file is missing, it degrades to the text stub.
+     via `brain.images.read_image_bytes(persona_dir, sha, media_type)` using the
+     provider's own `persona_dir`. If the file is missing, it degrades to the
+     text stub.
 7. **Tools.** The `tools` list is already OpenAI-shaped
    (`{"type": "function", "function": schema}` from `build_tools_list`) and
    is passed through unchanged. `tool_choice` is not sent (server default `auto`).
 
 ### Response handling
 
-- **Content cleanup** (both paths): remove `<think>…</think>` spans (and an
-  unterminated leading `<think>` span), ignore `reasoning_content` /
-  `reasoning` fields, then apply `_truncate_at_role_leak` as Ollama does.
+- **Content cleanup** (both paths): remove `<think>…</think>` spans, an
+  unterminated `<think>` span (to the end), and — non-streaming only — an
+  orphan `</think>` with no opening tag (everything up to and including it,
+  which is what servers emit when the chat template injects the opening tag).
+  `reasoning_content` / `reasoning` fields are ignored. Then apply
+  `_truncate_at_role_leak` as Ollama does.
 - **Non-streaming:** `choices[0].message` → content + `ToolCall.from_provider_dict`
-  for each `tool_calls` entry. A malformed tool call →
-  `ProviderError("openai_compat_parse", ...)`.
+  for each `tool_calls` entry, after normalizing: a missing or empty
+  `arguments` becomes `"{}"` (no-parameter tools), and a missing `id` becomes
+  `call_<n>`. A malformed tool call → `ProviderError("openai_compat_parse", ...)`.
 - **Streaming:** Server-Sent Events, one `data:` JSON per line, ending at
   `data: [DONE]`. Text deltas are yielded as they arrive, with the think-span
   filter applied incrementally so reasoning text never reaches the WS.
@@ -210,7 +220,7 @@ excerpt, the excerpt is dropped.
 
 ### Usage logging
 
-After each call (when `options["persona_dir"]` is present) the provider calls
+After each call (when the provider has a `persona_dir`) the provider calls
 the existing `log_usage(persona_dir, call_type="chat"|"chat_stream"|"generate",
 model=self._model, frame=...)` with
 `frame = {"usage": {"input_tokens": prompt_tokens, "output_tokens":
@@ -252,11 +262,12 @@ private helper.
   `generate(user_message, system=system_prompt)`. Otherwise the existing
   `ClaudeCliProvider` code runs unchanged. The failure logging path is shared.
   With no `persona_dir` the existing Claude path runs.
-- `brain/ingest/emotion_backfill.py` (`_make_default_tagger`, when
-  `provider is None`): the same kind check, using `TIER_BACKGROUND_CLASSIFIER`.
-  `_make_default_tagger` gains a `persona_dir: Path | None = None` parameter,
-  passed by its only caller `run_emotion_backfill(persona_dir, ...)`. When it is
-  `None`, the existing Claude default applies.
+- `brain/ingest/emotion_backfill.py`: **no change.** Its only production
+  caller (`supervisor.py`) already passes
+  `provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER)`, so it
+  follows the persona's provider kind. Its `ClaudeCliProvider` fallback is
+  dead in production (as `test_model_tier.py` notes). *(Amended during
+  planning.)*
 
 ### CLI — `brain/cli.py`
 
@@ -328,7 +339,7 @@ macOS, Linux and Windows.
   provider name is accepted.
 - `tests/unit/brain/bridge/test_model_tier.py` (extend): `openai-compat` tier
   mapping for interactive and background tiers; claude-cli assertions unchanged.
-- Factory, detector, backfill and CLI helper routing by provider kind;
+- Factory, detector and CLI helper routing by provider kind;
   `nell provider set-key` / `check` (check against a MockTransport server).
 - `_StreamingProxy` collects tool calls; the existing streaming-proxy tests
   stay green.
