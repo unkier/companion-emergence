@@ -429,6 +429,9 @@ class OpenAICompatProvider(LLMProvider):
         text: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         usage: object = None
+        finish_reason: str | None = None
+        saw_data = False
+        other: list[str] = []
         try:
             with (
                 self._client(timeout=self._settings.timeout_s) as client,
@@ -439,7 +442,8 @@ class OpenAICompatProvider(LLMProvider):
                     detail = http_error_detail(resp.status_code, url, body)
                     yield StreamError(stage="openai_compat_http", detail=detail)
                     return
-                for data in _sse_data(resp.iter_lines()):
+                for data in _sse_data(resp.iter_lines(), other):
+                    saw_data = True
                     if data == "[DONE]":
                         break
                     try:
@@ -457,7 +461,11 @@ class OpenAICompatProvider(LLMProvider):
                     if isinstance(chunk.get("usage"), dict):
                         usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
-                        delta = choice.get("delta") if isinstance(choice, dict) else None
+                        if not isinstance(choice, dict):
+                            continue
+                        if isinstance(choice.get("finish_reason"), str):
+                            finish_reason = choice["finish_reason"]
+                        delta = choice.get("delta")
                         if not isinstance(delta, dict):
                             continue
                         piece = delta.get("content")
@@ -477,6 +485,9 @@ class OpenAICompatProvider(LLMProvider):
             detail = f"cannot reach {url}: {type(exc).__name__}: {exc}"
             yield StreamError(stage="openai_compat_request", detail=detail)
             return
+        if not saw_data:
+            yield from self._non_sse_reply(url, other, started)
+            return
         tail = think.flush()
         if tail:
             text.append(tail)
@@ -486,11 +497,41 @@ class OpenAICompatProvider(LLMProvider):
         except ProviderError as exc:
             yield StreamError(stage=exc.stage, detail=exc.detail)
             return
-        yield from events
         self._log_usage("chat_stream", usage, started)
-        duration_ms = int((time.monotonic() - started) * 1000)
-        metadata = {"duration_ms": duration_ms, "authoritative_content": True}
-        yield StreamDone(content=clean_reply("".join(text)), metadata=metadata)
+        content = clean_reply("".join(text))
+        if not content and not events:
+            reason = f" (finish_reason: {finish_reason})" if finish_reason else ""
+            yield StreamError(stage="openai_compat_empty", detail=f"empty reply from {url}{reason}")
+            return
+        yield from events
+        yield _stream_done(content, started)
+
+    def _non_sse_reply(self, url: str, lines: list[str], started: float) -> Iterator[ChatStreamEvent]:
+        """Read a 200 reply that carried no SSE data: a server that ignored
+        ``stream: true`` (recovered as-is), a JSON error body, or nothing at all."""
+        body = "\n".join(lines).strip()
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            excerpt = f": {body[:200]}" if body else ""
+            yield StreamError(stage="openai_compat_parse", detail=f"no stream data from {url}{excerpt}")
+            return
+        try:
+            content, tool_calls = _completion_parts(data)
+        except ProviderError as exc:
+            yield StreamError(stage=exc.stage, detail=exc.detail)
+            return
+        self._log_usage("chat_stream", data.get("usage"), started)
+        if not content and not tool_calls:
+            yield StreamError(stage="openai_compat_empty", detail=f"empty reply from {url}")
+            return
+        if content:
+            yield TextDelta(text=content)
+        for call in tool_calls:
+            yield ToolCallEvent(id=call.id, name=call.name, arguments=call.arguments)
+        yield _stream_done(content, started)
 
     # -- internals ----------------------------------------------------------
 
@@ -539,19 +580,9 @@ class OpenAICompatProvider(LLMProvider):
     ) -> ChatResponse:
         started = time.monotonic()
         data = self._post(self._payload(messages, tools, options, stream=False))
-        message = _first_message(data)
-        raw_calls = message.get("tool_calls")
-        tool_calls = tuple(
-            _parse_tool_call(raw, index)
-            for index, raw in enumerate(raw_calls if isinstance(raw_calls, list) else [])
-        )
-        content = message.get("content")
+        content, tool_calls = _completion_parts(data)
         self._log_usage(call_type, data.get("usage"), started)
-        return ChatResponse(
-            content=clean_reply(content if isinstance(content, str) else ""),
-            tool_calls=tool_calls,
-            raw=data,
-        )
+        return ChatResponse(content=content, tool_calls=tool_calls, raw=data)
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = self._url("/chat/completions")
@@ -631,6 +662,18 @@ def _first_message(data: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+def _completion_parts(data: dict[str, Any]) -> tuple[str, tuple[ToolCall, ...]]:
+    """The cleaned reply text and the tool calls of a non-streamed completion."""
+    message = _first_message(data)
+    raw_calls = message.get("tool_calls")
+    tool_calls = tuple(
+        _parse_tool_call(raw, index)
+        for index, raw in enumerate(raw_calls if isinstance(raw_calls, list) else [])
+    )
+    content = message.get("content")
+    return clean_reply(content if isinstance(content, str) else ""), tool_calls
+
+
 def _parse_tool_call(raw: object, index: int) -> ToolCall:
     """Normalize one tool call (missing id, empty arguments) and parse it."""
     if not isinstance(raw, dict) or not isinstance(raw.get("function"), dict):
@@ -649,22 +692,41 @@ def _parse_tool_call(raw: object, index: int) -> ToolCall:
 # Streaming helpers
 # ---------------------------------------------------------------------------
 
+_SSE_FIELDS = (":", "event:", "id:", "retry:")
+_MAX_NON_SSE_CHARS = 1_000_000
 
-def _sse_data(lines: Iterator[str]) -> Iterator[str]:
-    """The ``data:`` payloads of an SSE stream; comments and keep-alives are skipped."""
+
+def _sse_data(lines: Iterator[str], other: list[str]) -> Iterator[str]:
+    """The ``data:`` payloads of an SSE stream; comments and keep-alives are skipped.
+
+    Lines that aren't SSE fields (a plain JSON body, an ``error:`` line) are kept
+    in ``other``, up to ~1 MB, so a reply that isn't an event stream can be read.
+    """
+    kept = 0
     for line in lines:
         if line.startswith("data:"):
             yield line[len("data:") :].strip()
+        elif line and not line.startswith(_SSE_FIELDS) and kept < _MAX_NON_SSE_CHARS:
+            other.append(line)
+            kept += len(line)
+
+
+def _stream_done(content: str, started: float) -> StreamDone:
+    duration_ms = int((time.monotonic() - started) * 1000)
+    # The content is cleaned (reasoning, role leaks), so it beats the joined deltas.
+    return StreamDone(content=content, metadata={"duration_ms": duration_ms, "authoritative_content": True})
 
 
 def _merge_tool_fragment(calls: dict[int, dict[str, str]], fragment: dict[str, Any]) -> None:
     """Fold one streamed tool-call fragment into ``calls`` (keyed by index)."""
     if isinstance(fragment.get("index"), int):
         index = fragment["index"]
-    elif fragment.get("id") or not calls:
-        index = len(calls)  # no index: a fragment with an id starts a new call
+    elif not calls:
+        index = 0
+    elif fragment.get("id") and str(fragment["id"]) != calls[max(calls)]["id"]:
+        index = len(calls)  # no index: a new id starts a new call
     else:
-        index = max(calls)  # no index, no id: it continues the latest call
+        index = max(calls)  # no index, same or no id: it continues the latest call
     slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
     if fragment.get("id"):
         slot["id"] = str(fragment["id"])

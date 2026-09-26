@@ -644,6 +644,71 @@ def test_stream_logs_usage_from_the_final_chunk(tmp_path: Path) -> None:
     assert (row["input_tokens"], row["output_tokens"]) == (5, 1)
 
 
+def test_stream_no_index_fragments_repeating_the_same_id_are_one_call() -> None:
+    """Review Focus 3: some servers repeat the call id on every fragment."""
+    events = _stream(
+        _sse(
+            _delta(tool_calls=[{"id": "c1", "function": {"name": "search_memories", "arguments": ""}}]),
+            _delta(tool_calls=[{"id": "c1", "function": {"arguments": '{"query": '}}]),
+            _delta(tool_calls=[{"id": "c1", "function": {"arguments": '"tea"}'}}]),
+        )
+    )
+    assert [e for e in events if isinstance(e, ToolCallEvent)] == [
+        ToolCallEvent(id="c1", name="search_memories", arguments={"query": "tea"})
+    ]
+
+
+def test_stream_json_error_body_instead_of_sse_yields_a_stream_error() -> None:
+    """Review Focus 5: HTTP 200, but the body is a JSON error, not an event stream."""
+    events = _stream(json.dumps({"error": {"message": "model not loaded"}}).encode())
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert "model not loaded" in events[0].detail
+
+
+def test_stream_recovers_a_plain_json_completion_when_the_server_ignores_stream() -> None:
+    events = _stream(json.dumps(_completion("Hello there")).encode())
+    assert _texts(events) == "Hello there"
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].content == "Hello there"
+
+
+def test_stream_recovers_tool_calls_from_a_plain_json_completion() -> None:
+    call = {"id": "c1", "type": "function", "function": {"name": "get_soul", "arguments": ""}}
+    events = _stream(json.dumps(_completion(None, tool_calls=[call])).encode())
+    assert [e for e in events if isinstance(e, ToolCallEvent)] == [
+        ToolCallEvent(id="c1", name="get_soul", arguments={})
+    ]
+    assert isinstance(events[-1], StreamDone)
+
+
+def test_stream_with_an_empty_body_yields_a_stream_error() -> None:
+    events = _stream(b"")
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].stage == "openai_compat_parse"
+    assert "no stream data" in events[0].detail
+
+
+def test_stream_error_event_line_yields_a_stream_error() -> None:
+    """Older llama.cpp builds report errors as ``error:`` lines."""
+    events = _stream(b'error: {"code": 500, "message": "context size exceeded"}\n\n')
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert "context size exceeded" in events[0].detail
+
+
+def test_stream_with_no_reply_and_no_tool_calls_yields_a_stream_error() -> None:
+    """A reasoning model that hits max_tokens inside <think> leaves nothing to say;
+    that must surface as an error naming the finish reason, not an empty bubble."""
+    finish = {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+    events = _stream(_sse(_delta("<think>still going"), finish))
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].stage == "openai_compat_empty"
+    assert "length" in events[-1].detail
+    assert not any(isinstance(e, StreamDone) for e in events)
+
+
 # ── factory ────────────────────────────────────────────────────────────────
 
 
