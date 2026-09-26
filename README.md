@@ -245,7 +245,7 @@ Everything lives on your machine. The persona dir is <code>chmod 0700</code> on 
 <details>
 <summary><b>Why does it require Anthropic Claude? Can I use a local model?</b></summary>
 <br/>
-Claude is the default and best-tested provider — the framework's emotional reasoning + tool-use architecture takes advantage of Claude's multi-turn coherence. An <code>OllamaProvider</code> ships in the codebase but is less well-tuned. The provider abstraction is clean; adding a new one is a focused change to <code>brain/bridge/provider.py</code>.
+Claude is the default and best-tested provider — the framework's emotional reasoning + tool-use architecture takes advantage of Claude's multi-turn coherence. You can also run a Kindled on any OpenAI-compatible endpoint — a local server (LM Studio, llama.cpp, vLLM, Ollama's <code>/v1</code>) or a hosted API — with the <code>openai-compat</code> provider; see <a href="docs/openai-compat-provider.md">docs/openai-compat-provider.md</a>. The model needs solid tool calling. An <code>OllamaProvider</code> also ships in the codebase but is less well-tuned.
 </details>
 
 <details>
