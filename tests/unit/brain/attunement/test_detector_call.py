@@ -206,3 +206,67 @@ def test_detector_threads_companion_name_into_system_prompt(buffer):
 
     assert "between Alex (the user) and the user's companion, Mira" in captured["system_prompt"]
     assert 'never "Claude"' in captured["system_prompt"]
+
+
+# ── provider kind routing (openai-compat) ────────────────────────────────────
+
+
+def _openai_compat_config(persona_dir):
+    import json as _json
+
+    block = {"base_url": "http://127.0.0.1:9/v1", "model": "m"}
+    (persona_dir / "persona_config.json").write_text(
+        _json.dumps({"provider": "openai-compat", "openai_compat": block})
+    )
+
+
+def test_call_haiku_uses_the_tier_provider_for_an_openai_compat_persona(tmp_path, monkeypatch):
+    import brain.attunement.detector as det
+    from brain.bridge import model_tier
+    from brain.bridge.provider import ClaudeCliProvider
+
+    _openai_compat_config(tmp_path)
+    seen = {}
+
+    class _Fake:
+        def generate(self, prompt, *, system=None):
+            seen["prompt"], seen["system"] = prompt, system
+            return '{"ok": true}'
+
+    def fake_build(persona_dir, tier):
+        seen["persona_dir"], seen["tier"] = persona_dir, tier
+        return _Fake()
+
+    def claude_must_not_run(*_a, **_k):
+        raise AssertionError("an openai-compat persona must not use the Claude CLI")
+
+    monkeypatch.setattr(model_tier, "build_tier_provider", fake_build)
+    monkeypatch.setattr(ClaudeCliProvider, "generate", claude_must_not_run)
+
+    assert det._call_haiku("sys", "usr", persona_dir=tmp_path) == '{"ok": true}'
+    assert seen == {
+        "persona_dir": tmp_path,
+        "tier": "attunement-detector",
+        "prompt": "usr",
+        "system": "sys",
+    }
+
+
+def test_call_haiku_openai_compat_failure_writes_an_error_row(tmp_path, monkeypatch):
+    import json as _json
+
+    import brain.attunement.detector as det
+    from brain.bridge import model_tier
+    from brain.bridge.provider import ProviderError
+
+    _openai_compat_config(tmp_path)
+
+    class _Failing:
+        def generate(self, prompt, *, system=None):
+            raise ProviderError("openai_compat_request", "refused")
+
+    monkeypatch.setattr(model_tier, "build_tier_provider", lambda _pd, _tier: _Failing())
+
+    assert det._call_haiku("sys", "usr", persona_dir=tmp_path) == ""
+    rows = (tmp_path / "attunement_errors.jsonl").read_text().strip().splitlines()
+    assert "refused" in _json.loads(rows[-1])["error"]
