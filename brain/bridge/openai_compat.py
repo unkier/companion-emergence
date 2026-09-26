@@ -739,3 +739,23 @@ def _partial_tag_suffix(text: str, tag: str) -> int:
         if text.endswith(tag[:size]):
             return size
     return 0
+
+
+def build_openai_compat_provider(
+    persona_dir: Path,
+    *,
+    tier: str | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> OpenAICompatProvider:
+    """The provider for ``persona_dir``'s openai_compat block, on ``tier``'s model."""
+    from brain.persona_config import PersonaConfig
+
+    cfg = PersonaConfig.load(persona_dir / "persona_config.json")
+    settings = OpenAICompatSettings.from_config(cfg.openai_compat)
+    return OpenAICompatProvider(
+        settings,
+        settings.model_for_tier(tier),
+        resolve_api_key(persona_dir),
+        persona_dir=persona_dir,
+        transport=transport,
+    )

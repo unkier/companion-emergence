@@ -2022,13 +2022,14 @@ def get_provider(
     *,
     persona_dir: Path | None = None,
     model_override: str | None = None,
+    tier: str | None = None,
 ) -> LLMProvider:
     """Resolve a provider identifier to an instance.
 
     Parameters
     ----------
     name:
-        Provider name — "claude-cli", "ollama", or "fake".
+        Provider name — "claude-cli", "ollama", "openai-compat", or "fake".
     persona_dir:
         Optional path to the persona directory. When provided and the
         provider is "claude-cli", the model is read from the persona's
@@ -2037,6 +2038,11 @@ def get_provider(
         Explicit model name that wins over both persona_config and the
         default. Useful for CLI --model flags. Ignored for non-claude-cli
         providers.
+    tier:
+        Model-tier name (``brain.bridge.model_tier.TIER_*``). Only "openai-compat"
+        uses it, to pick the persona's per-tier model; that provider also needs
+        ``persona_dir`` (its endpoint lives in persona_config.json) and ignores the
+        Claude-alias model override.
 
     Raises ValueError on unknown name.
     """
@@ -2055,4 +2061,12 @@ def get_provider(
         return ClaudeCliProvider(model=model)
     if name == "ollama":
         return OllamaProvider()
+    if name == "openai-compat":
+        if persona_dir is None:
+            raise ProviderError(
+                "openai_compat_config", "persona_dir is required for the openai-compat provider"
+            )
+        from brain.bridge.openai_compat import build_openai_compat_provider
+
+        return build_openai_compat_provider(persona_dir, tier=tier)
     raise ValueError(f"Unknown provider: {name!r}")

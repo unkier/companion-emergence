@@ -219,7 +219,7 @@ TIER_BACKGROUND_GENERATIVE = "background-generative"
 TIER_BACKGROUND_HOUSEKEEPING = "background-housekeeping"
 TIER_DEV_CLI = "dev-cli"
 # Embedding is not a Claude-LLM tier — it never goes through get_provider/
-# build_tier_provider (those are Claude-scoped: claude-cli/ollama/fake
+# build_tier_provider (those are Claude-scoped: claude-cli/ollama/openai-compat/fake
 # provider *kinds*, Claude model aliases). It's registered here anyway so the
 # model id lives in ONE place with every other model selection; construct the
 # actual provider via build_embedding_provider() in brain/memory/embeddings.py,
@@ -270,7 +270,7 @@ def model_for_tier(tier: str) -> str:
 
 
 def _resolve_provider_kind(persona_dir: Path) -> str:
-    """The persona's provider *kind* (claude-cli / ollama / fake), read from
+    """The persona's provider *kind* (claude-cli / ollama / openai-compat / fake), read from
     ``persona_config.json`` if present, else ``DEFAULT_PROVIDER``.
 
     Shared by ``build_tier_provider`` and ``build_interactive_chat_provider`` so
@@ -286,9 +286,14 @@ def _resolve_provider_kind(persona_dir: Path) -> str:
     return DEFAULT_PROVIDER
 
 
+def provider_kind(persona_dir: Path) -> str:
+    """Public: the persona's provider kind (claude-cli / ollama / openai-compat / fake)."""
+    return _resolve_provider_kind(persona_dir)
+
+
 def build_tier_provider(persona_dir: Path, tier: str) -> Any:
     """The provider a given tier should use: the persona's provider *kind*
-    (claude-cli / ollama / fake) but forced to ``model_for_tier(tier)``.
+    (claude-cli / ollama / openai-compat / fake) but forced to ``model_for_tier(tier)``.
 
     Generalizes ``build_compaction_provider``/``build_self_model_provider`` —
     same shape, parametrized by tier instead of duplicated per call site.
@@ -296,7 +301,9 @@ def build_tier_provider(persona_dir: Path, tier: str) -> Any:
     from brain.bridge.provider import get_provider
 
     name = _resolve_provider_kind(persona_dir)
-    return get_provider(name, persona_dir=Path(persona_dir), model_override=model_for_tier(tier))
+    return get_provider(
+        name, persona_dir=Path(persona_dir), model_override=model_for_tier(tier), tier=tier
+    )
 
 
 def build_interactive_chat_provider(persona_dir: Path) -> Any:
@@ -321,7 +328,7 @@ def build_interactive_chat_provider(persona_dir: Path) -> Any:
     from brain.bridge.provider import get_provider
 
     name = _resolve_provider_kind(persona_dir)
-    return get_provider(name, persona_dir=Path(persona_dir))
+    return get_provider(name, persona_dir=Path(persona_dir), tier=TIER_INTERACTIVE_CHAT)
 
 
 def model_label_for_provider(provider: Any, tier: str) -> str:

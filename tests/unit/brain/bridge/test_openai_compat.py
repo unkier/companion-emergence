@@ -24,6 +24,7 @@ from brain.bridge.chat import (
     ToolCall,
     ToolCallEvent,
 )
+from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, TIER_COMPACTION
 from brain.bridge.openai_compat import (
     API_KEY_ENV,
     SECRETS_FILENAME,
@@ -35,7 +36,7 @@ from brain.bridge.openai_compat import (
     to_openai_messages,
     write_api_key,
 )
-from brain.bridge.provider import ProviderError
+from brain.bridge.provider import ProviderError, get_provider
 
 _MIN_BLOCK = {"base_url": "http://localhost:1234/v1/", "model": "main-model"}
 
@@ -641,3 +642,54 @@ def test_stream_logs_usage_from_the_final_chunk(tmp_path: Path) -> None:
     row = json.loads((tmp_path / "chat_usage.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["call_type"] == "chat_stream"
     assert (row["input_tokens"], row["output_tokens"]) == (5, 1)
+
+
+# ── factory ────────────────────────────────────────────────────────────────
+
+
+def _openai_persona(tmp_path: Path, **block: object) -> Path:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    config = {"provider": "openai-compat", "openai_compat": {**_MIN_BLOCK, **block}}
+    (persona_dir / "persona_config.json").write_text(json.dumps(config), encoding="utf-8")
+    return persona_dir
+
+
+def test_get_provider_openai_compat_requires_persona_dir() -> None:
+    with pytest.raises(ProviderError) as info:
+        get_provider("openai-compat")
+    assert info.value.stage == "openai_compat_config"
+
+
+def test_get_provider_openai_compat_without_a_block_fails_loudly(tmp_path: Path) -> None:
+    (tmp_path / "persona_config.json").write_text('{"provider": "openai-compat"}', encoding="utf-8")
+    with pytest.raises(ProviderError) as info:
+        get_provider("openai-compat", persona_dir=tmp_path)
+    assert info.value.stage == "openai_compat_config"
+
+
+def test_get_provider_openai_compat_picks_the_tier_model(tmp_path: Path) -> None:
+    persona_dir = _openai_persona(tmp_path, tier_models={"compaction": "small-model"})
+    provider = get_provider("openai-compat", persona_dir=persona_dir, tier=TIER_COMPACTION)
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider._model == "small-model"
+
+
+def test_get_provider_openai_compat_ignores_a_claude_alias_override(tmp_path: Path) -> None:
+    persona_dir = _openai_persona(tmp_path)
+    provider = get_provider(
+        "openai-compat",
+        persona_dir=persona_dir,
+        model_override="haiku",
+        tier=TIER_BACKGROUND_CLASSIFIER,
+    )
+    assert provider._model == "main-model"
+
+
+def test_get_provider_openai_compat_reads_the_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    persona_dir = _openai_persona(tmp_path)
+    write_api_key(persona_dir, "sk-x")
+    assert get_provider("openai-compat", persona_dir=persona_dir)._api_key == "sk-x"
