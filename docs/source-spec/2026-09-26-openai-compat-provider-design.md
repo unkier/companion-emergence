@@ -31,7 +31,10 @@ provider.
 - Chat-time web search/fetch for non-Claude providers (the Claude CLI's built-in
   `WebSearch`/`WebFetch` have no equivalent here; background research keeps
   working through the `ddgs` searcher).
-- Retries, rate-limit backoff, cost estimation.
+- Rate-limit backoff beyond one retry, cost estimation. (Amended 2026-09-27: a live
+  Polza test showed ~1 in 6 requests failing on a flaky gateway route, so transient
+  failures — HTTP 408/429/5xx, or a gateway error naming its upstream provider — are
+  retried once, and streams only before anything was yielded.)
 
 ## 1. Configuration
 

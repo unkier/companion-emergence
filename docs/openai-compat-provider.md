@@ -49,6 +49,11 @@ Works with local servers (LM Studio, llama.cpp `llama-server`, vLLM, Ollama's
 | `vision` | no | `false` | Send images she opens as image parts; only enable for vision models |
 | `timeout_s` | no | `300` | Request timeout; when streaming, the longest silence between chunks |
 
+A request that fails in a way a second try can fix — HTTP 408, 429 or 5xx, or a
+gateway such as OpenRouter or Polza reporting that the upstream provider it
+picked failed — is retried once after a second. A streamed reply is only
+retried if nothing has been shown yet. Timeouts are not retried.
+
 ### Tiers
 
 | Tier | What runs on it |

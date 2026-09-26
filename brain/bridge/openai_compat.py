@@ -18,6 +18,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -419,13 +420,29 @@ class OpenAICompatProvider(LLMProvider):
     ) -> Iterator[ChatStreamEvent]:
         """Stream a reply: TextDelta…, then ToolCallEvent…, then StreamDone.
 
-        On failure yields one StreamError and stops. ``timeout_s`` is applied as
-        httpx's read timeout, so it bounds the gap between chunks, not the total.
+        On failure yields one StreamError and stops; a transient failure that
+        arrives before anything was yielded is retried once first. ``timeout_s``
+        is applied as httpx's read timeout, so it bounds the gap between chunks,
+        not the total.
         """
-        for event in self._stream_events(messages, tools, options):
-            if isinstance(event, StreamError):
-                event = StreamError(stage=event.stage, detail=_safe_detail(event.detail, self._api_key))
-            yield event
+        for attempt in (1, 2):
+            streamed = False
+            with closing(self._stream_events(messages, tools, options)) as events:
+                for event in events:
+                    if isinstance(event, _Transient):
+                        if attempt == 1 and not streamed:
+                            break
+                        event = event.error
+                    if isinstance(event, StreamError):
+                        detail = _safe_detail(event.detail, self._api_key)
+                        event = StreamError(stage=event.stage, detail=detail)
+                    else:
+                        streamed = True
+                    yield event
+                else:
+                    return
+            # Only the break on a first-attempt _Transient gets here.
+            self._pause_before_retry(event.error.detail)
 
     def _stream_events(
         self,
@@ -451,7 +468,8 @@ class OpenAICompatProvider(LLMProvider):
                 if not resp.is_success:
                     body = resp.read().decode("utf-8", "replace")
                     detail = http_error_detail(resp.status_code, url, body)
-                    yield StreamError(stage="openai_compat_http", detail=detail)
+                    error = StreamError(stage="openai_compat_http", detail=detail)
+                    yield _Transient(error) if _transient_http(resp.status_code, body) else error
                     return
                 for data in _sse_data(resp.iter_lines(), other):
                     saw_data = True
@@ -467,7 +485,8 @@ class OpenAICompatProvider(LLMProvider):
                         continue
                     if chunk.get("error"):
                         detail = f"endpoint error mid-stream: {json.dumps(chunk['error'])[:200]}"
-                        yield StreamError(stage="openai_compat_http", detail=detail)
+                        error = StreamError(stage="openai_compat_http", detail=detail)
+                        yield _Transient(error) if _transient_error(chunk["error"]) else error
                         return
                     if isinstance(chunk.get("usage"), dict):
                         usage = chunk["usage"]
@@ -590,8 +609,13 @@ class OpenAICompatProvider(LLMProvider):
         call_type: str,
     ) -> ChatResponse:
         started = time.monotonic()
+        payload = self._payload(messages, tools, options, stream=False)
         try:
-            data = self._post(self._payload(messages, tools, options, stream=False))
+            try:
+                data = self._post(payload)
+            except _TransientHTTPError as exc:
+                self._pause_before_retry(exc.detail)
+                data = self._post(payload)
             content, tool_calls = _completion_parts(data)
         except ProviderError as exc:
             safe = _safe_detail(exc.detail, self._api_key)
@@ -616,9 +640,10 @@ class OpenAICompatProvider(LLMProvider):
                 "openai_compat_request", f"cannot reach {url}: {type(exc).__name__}: {exc}"
             ) from exc
         if not resp.is_success:
-            raise ProviderError(
-                "openai_compat_http", http_error_detail(resp.status_code, url, resp.text)
-            )
+            detail = http_error_detail(resp.status_code, url, resp.text)
+            if _transient_http(resp.status_code, resp.text):
+                raise _TransientHTTPError("openai_compat_http", detail)
+            raise ProviderError("openai_compat_http", detail)
         try:
             data = resp.json()
         except ValueError as exc:
@@ -628,6 +653,12 @@ class OpenAICompatProvider(LLMProvider):
         if not isinstance(data, dict):
             raise ProviderError("openai_compat_parse", f"response from {url} is not a JSON object")
         return data
+
+    def _pause_before_retry(self, detail: str) -> None:
+        logger.warning(
+            "openai_compat: transient failure, retrying once: %s", _safe_detail(detail, self._api_key)
+        )
+        time.sleep(_RETRY_DELAY_S)
 
     def _log_usage(self, call_type: str, usage: object, started: float) -> None:
         if self._persona_dir is None:
@@ -666,6 +697,52 @@ def http_error_detail(status: int, url: str, body: str) -> str:
             f"{SECRETS_FILENAME} or ${API_KEY_ENV}: {excerpt}"
         )
     return f"HTTP {status} from {url}: {excerpt}"
+
+
+# One retry, after this pause, for failures that a second try can fix: timeouts
+# and rate limits reported as HTTP status, server errors, and a gateway
+# (OpenRouter, Polza, ...) reporting that the upstream provider it picked failed.
+# A streamed reply is retried only while nothing has been yielded yet.
+_RETRY_DELAY_S = 1.0
+_RETRY_STATUSES = frozenset({408, 429})
+
+
+class _TransientHTTPError(ProviderError):
+    """An HTTP failure worth one retry."""
+
+
+@dataclass(frozen=True)
+class _Transient:
+    """Wraps a StreamError worth one retry; unwrapped by ``chat_stream``."""
+
+    error: StreamError
+
+
+def _retryable_status(status: object) -> bool:
+    return isinstance(status, int) and (status in _RETRY_STATUSES or 500 <= status < 600)
+
+
+def _transient_error(error: object) -> bool:
+    """An ``error`` object that a retry may clear: a retryable code, or a gateway
+    naming the upstream provider that failed (``metadata.provider_name``)."""
+    if not isinstance(error, dict):
+        return False
+    metadata = error.get("metadata")
+    return _retryable_status(error.get("code")) or (
+        isinstance(metadata, dict) and bool(metadata.get("provider_name"))
+    )
+
+
+def _transient_http(status: int, body: str) -> bool:
+    if _retryable_status(status):
+        return True
+    if status != 400:
+        return False
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and _transient_error(data.get("error"))
 
 
 def _safe_detail(detail: str, api_key: str | None) -> str:

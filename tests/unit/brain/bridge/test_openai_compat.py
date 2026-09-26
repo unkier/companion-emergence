@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from brain.bridge import provider_auth
+from brain.bridge import openai_compat, provider_auth
 from brain.bridge.chat import (
     ChatMessage,
     ImageBlock,
@@ -749,6 +749,127 @@ def test_an_echoed_api_key_is_redacted_from_error_details() -> None:
     events = list(provider.chat_stream([_user("hi")]))
     assert isinstance(events[-1], StreamError)
     assert key not in events[-1].detail
+
+
+# ── one retry on transient failures ────────────────────────────────────────
+
+_GATEWAY_400 = {
+    "error": {
+        "code": "BAD_REQUEST",
+        "message": "Backend request failed with status 400",
+        "metadata": {"provider_name": "GMICloud", "attempts": [{"provider": "OpenRouter", "reason": "UNKNOWN"}]},
+    }
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch):
+    monkeypatch.setattr(openai_compat, "_RETRY_DELAY_S", 0.0)
+
+
+def _flaky(first: httpx.Response, then: httpx.Response):
+    """A handler that answers ``first`` once, then ``then``; records every call."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return first if len(calls) == 1 else then
+
+    return handler, calls
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        httpx.Response(400, json=_GATEWAY_400),
+        httpx.Response(408, text="timeout"),
+        httpx.Response(429, text="slow down"),
+        httpx.Response(500, text="boom"),
+        httpx.Response(503, text="unavailable"),
+    ],
+    ids=["gateway-400", "408", "429", "500", "503"],
+)
+def test_chat_retries_a_transient_failure_once(first: httpx.Response) -> None:
+    handler, calls = _flaky(first, httpx.Response(200, json=_completion("recovered")))
+    assert _provider(handler).chat([_user("hi")]).content == "recovered"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        httpx.Response(400, json={"error": {"message": "bad parameter"}}),
+        httpx.Response(401, text="no key"),
+        httpx.Response(404, text="no such route"),
+    ],
+    ids=["plain-400", "401", "404"],
+)
+def test_chat_does_not_retry_a_request_that_cannot_succeed(first: httpx.Response) -> None:
+    handler, calls = _flaky(first, httpx.Response(200, json=_completion("unreachable")))
+    with pytest.raises(ProviderError):
+        _provider(handler).chat([_user("hi")])
+    assert len(calls) == 1
+
+
+def test_chat_gives_up_after_one_retry() -> None:
+    handler, calls = _flaky(httpx.Response(503, text="down"), httpx.Response(503, text="still down"))
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert len(calls) == 2
+    assert "still down" in info.value.detail
+
+
+def test_chat_timeouts_are_not_retried() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(ProviderError):
+        _provider(handler).chat([_user("hi")])
+    assert len(calls) == 1
+
+
+def test_stream_retries_a_transient_http_failure_before_anything_streamed() -> None:
+    handler, calls = _flaky(httpx.Response(400, json=_GATEWAY_400), httpx.Response(200, content=_sse(_delta("Hello"))))
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(calls) == 2
+    assert not any(isinstance(e, StreamError) for e in events)
+    assert _texts(events) == "Hello"
+
+
+def test_stream_retries_a_gateway_error_chunk_that_arrives_before_any_text() -> None:
+    error_chunk = {"error": {"code": 502, "message": "Provider returned error", "metadata": {"provider_name": "X"}}}
+    handler, calls = _flaky(
+        httpx.Response(200, content=_sse(error_chunk)),
+        httpx.Response(200, content=_sse(_delta("Hello"))),
+    )
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(calls) == 2
+    assert _texts(events) == "Hello"
+    assert isinstance(events[-1], StreamDone)
+
+
+def test_stream_does_not_retry_once_text_has_streamed() -> None:
+    error_chunk = {"error": {"code": 502, "message": "Provider returned error", "metadata": {"provider_name": "X"}}}
+    handler, calls = _flaky(
+        httpx.Response(200, content=_sse(_delta("par"), error_chunk)),
+        httpx.Response(200, content=_sse(_delta("Hello"))),
+    )
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(calls) == 1
+    assert _texts(events) == "par"
+    assert isinstance(events[-1], StreamError)
+
+
+def test_stream_gives_up_after_one_retry() -> None:
+    handler, calls = _flaky(httpx.Response(503, text="down"), httpx.Response(503, text="still down"))
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(calls) == 2
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert "still down" in events[0].detail
 
 
 # ── factory ────────────────────────────────────────────────────────────────
