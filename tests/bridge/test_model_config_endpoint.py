@@ -117,3 +117,25 @@ def test_endpoint_swaps_live_provider_model_and_state_reflects_it(tmp_path: Path
         assert r2.status_code == 200, r2.text
         state = r2.json()
         assert state["connection"]["model"] == "opus"
+
+
+def test_endpoint_refuses_model_switch_for_an_openai_compat_persona(tmp_path: Path):
+    """openai-compat models live in the openai_compat block; the Claude-alias
+    picker must not write `opus` into this persona."""
+    persona_dir = tmp_path / "personas" / "test"
+    persona_dir.mkdir(parents=True)
+    block = {"base_url": "http://127.0.0.1:9/v1", "model": "local-model"}
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({"provider": "openai-compat", "searcher": "noop", "openai_compat": block})
+    )
+    app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token=None)
+    with TestClient(app) as client:
+        r = client.post("/persona/config/model", json={"model": "opus"})
+    assert r.status_code == 409, r.text
+    assert r.json() == {"ok": False, "error": "model_managed_in_config"}
+
+    from brain.persona_config import PersonaConfig
+
+    reloaded = PersonaConfig.load(persona_dir / "persona_config.json")
+    assert reloaded.model == "sonnet"
+    assert reloaded.openai_compat == block

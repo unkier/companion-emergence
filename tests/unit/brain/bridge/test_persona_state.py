@@ -553,3 +553,32 @@ def test_connection_includes_kindled_link_fields(tmp_path: Path) -> None:
     conn = build_persona_state(persona_dir)["connection"]
     assert conn["kindled_link_enabled"] is True
     assert conn["kindled_relay_url"] == "http://127.0.0.1:9000"
+
+
+def test_build_persona_state_connection_block_reports_the_openai_compat_model(
+    tmp_path: Path,
+) -> None:
+    from brain.persona_config import PersonaConfig
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    PersonaConfig(
+        provider="openai-compat",
+        openai_compat={"base_url": "http://127.0.0.1:9/v1", "model": "qwen3-32b"},
+    ).save(persona_dir / "persona_config.json")
+
+    conn = build_persona_state(persona_dir)["connection"]
+    assert conn["provider"] == "openai-compat"
+    assert conn["model"] == "qwen3-32b"
+
+
+def test_build_persona_state_openai_compat_without_a_block_reports_no_model(
+    tmp_path: Path,
+) -> None:
+    from brain.persona_config import PersonaConfig
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    PersonaConfig(provider="openai-compat").save(persona_dir / "persona_config.json")
+
+    assert build_persona_state(persona_dir)["connection"]["model"] is None

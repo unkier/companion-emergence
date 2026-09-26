@@ -229,7 +229,11 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
 
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         out["provider"] = cfg.provider
-        out["model"] = cfg.model
+        out["model"] = (
+            _openai_compat_model(cfg.openai_compat)
+            if cfg.provider == "openai-compat"
+            else cfg.model
+        )
         out["user_pronouns"] = preset_key_for(cfg.user_pronouns)
         out["kindled_link_enabled"] = cfg.kindled_link_enabled
         out["kindled_relay_url"] = cfg.kindled_relay_url
@@ -245,6 +249,12 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: heartbeat_state read failed", exc_info=True)
     return out
+
+
+def _openai_compat_model(block: object) -> str | None:
+    """The openai-compat default model, or None when the block is missing/invalid."""
+    model = block.get("model") if isinstance(block, dict) else None
+    return model if isinstance(model, str) and model.strip() else None
 
 
 def _default_model_for(provider: str) -> str | None:

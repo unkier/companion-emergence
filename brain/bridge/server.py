@@ -1744,11 +1744,22 @@ def build_app(
 
         Returns: {ok: true, model: <new_model>}
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+                 409 {ok: false, error: "model_managed_in_config"} — openai-compat persona
         """
         from dataclasses import replace as dc_replace
 
         from brain.persona_config import KNOWN_MODELS, PersonaConfig
 
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        current = PersonaConfig.load(config_path)
+        if current.provider == "openai-compat":
+            # Its models live per tier in the openai_compat block; this route only
+            # knows Claude aliases, so writing one here would silently be wrong.
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "error": "model_managed_in_config"},
+            )
         if req.model not in KNOWN_MODELS:
             return JSONResponse(
                 status_code=400,
@@ -1758,9 +1769,6 @@ def build_app(
                     "valid": sorted(KNOWN_MODELS),
                 },
             )
-        s: BridgeAppState = app.state.bridge
-        config_path = s.persona_dir / "persona_config.json"
-        current = PersonaConfig.load(config_path)
         updated = dc_replace(current, model=req.model)
         updated.save(config_path)
         # Hot-swap: if the live provider exposes _model, update it so the
