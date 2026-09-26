@@ -709,6 +709,48 @@ def test_stream_with_no_reply_and_no_tool_calls_yields_a_stream_error() -> None:
     assert not any(isinstance(e, StreamDone) for e in events)
 
 
+_AUTH_BODIES = [
+    {"error": {"message": "Not logged in"}},
+    {"error": {"message": "Failed to authenticate request"}},
+]
+
+
+@pytest.mark.parametrize("body", _AUTH_BODIES)
+def test_chat_error_body_with_a_claude_login_phrase_is_not_an_auth_failure(body: dict) -> None:
+    """A 200 error body saying 'not logged in' must not trigger the Claude re-login flow."""
+    provider = _provider(lambda request: httpx.Response(200, json=body))
+    with pytest.raises(ProviderError) as info:
+        provider.chat([_user("hi")])
+    assert not provider_auth.is_auth_failure(str(info.value))
+    assert "authentication" in info.value.detail
+
+
+def test_chat_non_json_body_with_a_claude_login_phrase_is_not_an_auth_failure() -> None:
+    provider = _provider(lambda request: httpx.Response(200, text="<html>You are not logged in</html>"))
+    with pytest.raises(ProviderError) as info:
+        provider.chat([_user("hi")])
+    assert not provider_auth.is_auth_failure(str(info.value))
+
+
+@pytest.mark.parametrize("body", _AUTH_BODIES)
+def test_stream_error_chunk_with_a_claude_login_phrase_is_not_an_auth_failure(body: dict) -> None:
+    events = _stream(_sse(_delta("par"), body))
+    assert isinstance(events[-1], StreamError)
+    assert not provider_auth.is_auth_failure(events[-1].detail)
+
+
+def test_an_echoed_api_key_is_redacted_from_error_details() -> None:
+    key = "sk-test-echo-1234567890"
+    echo = lambda request: httpx.Response(400, text=f"bad request for key {key}")  # noqa: E731
+    provider = _provider(echo, api_key=key)
+    with pytest.raises(ProviderError) as info:
+        provider.chat([_user("hi")])
+    assert key not in str(info.value)
+    events = list(provider.chat_stream([_user("hi")]))
+    assert isinstance(events[-1], StreamError)
+    assert key not in events[-1].detail
+
+
 # ── factory ────────────────────────────────────────────────────────────────
 
 

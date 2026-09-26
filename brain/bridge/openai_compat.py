@@ -422,6 +422,17 @@ class OpenAICompatProvider(LLMProvider):
         On failure yields one StreamError and stops. ``timeout_s`` is applied as
         httpx's read timeout, so it bounds the gap between chunks, not the total.
         """
+        for event in self._stream_events(messages, tools, options):
+            if isinstance(event, StreamError):
+                event = StreamError(stage=event.stage, detail=_safe_detail(event.detail, self._api_key))
+            yield event
+
+    def _stream_events(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        options: dict[str, Any] | None,
+    ) -> Iterator[ChatStreamEvent]:
         payload = self._payload(messages, tools, options, stream=True)
         url = self._url("/chat/completions")
         started = time.monotonic()
@@ -579,8 +590,14 @@ class OpenAICompatProvider(LLMProvider):
         call_type: str,
     ) -> ChatResponse:
         started = time.monotonic()
-        data = self._post(self._payload(messages, tools, options, stream=False))
-        content, tool_calls = _completion_parts(data)
+        try:
+            data = self._post(self._payload(messages, tools, options, stream=False))
+            content, tool_calls = _completion_parts(data)
+        except ProviderError as exc:
+            safe = _safe_detail(exc.detail, self._api_key)
+            if safe == exc.detail:
+                raise
+            raise ProviderError(exc.stage, safe) from None
         self._log_usage(call_type, data.get("usage"), started)
         return ChatResponse(content=content, tool_calls=tool_calls, raw=data)
 
@@ -649,6 +666,19 @@ def http_error_detail(status: int, url: str, body: str) -> str:
             f"{SECRETS_FILENAME} or ${API_KEY_ENV}: {excerpt}"
         )
     return f"HTTP {status} from {url}: {excerpt}"
+
+
+def _safe_detail(detail: str, api_key: str | None) -> str:
+    """Error detail fit to leave the provider: an echoed API key is redacted, and
+    no provider_auth marker survives to set off the Claude re-login flow."""
+    if api_key:
+        detail = detail.replace(api_key, "[redacted]")
+    if provider_auth.is_auth_failure(detail):
+        return (
+            "endpoint reported an authentication failure (its message is omitted) — "
+            f"check the API key in the persona's {SECRETS_FILENAME} or ${API_KEY_ENV}"
+        )
+    return detail
 
 
 def _first_message(data: dict[str, Any]) -> dict[str, Any]:
