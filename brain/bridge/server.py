@@ -55,6 +55,8 @@ from brain.bridge.chat import (
     StreamDone,
     StreamError,
     TextDelta,
+    ToolCall,
+    ToolCallEvent,
 )
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
@@ -295,6 +297,11 @@ class _StreamingProxy:
     If the real provider does not implement chat_stream() (e.g. OllamaProvider,
     FakeProvider), chat() falls back to the real provider's chat() unchanged and
     no chunks are forwarded (the None sentinel is still sent so the WS loop exits).
+
+    Providers that hand tool calls back to run_tool_loop (openai-compat) stream
+    them as ToolCallEvents; they are collected into ChatResponse.tool_calls so
+    the loop dispatches them. The Claude CLI runs its tools in-process and never
+    yields ToolCallEvent, so its path is unchanged.
     """
 
     def __init__(
@@ -365,11 +372,20 @@ class _StreamingProxy:
             return resp
 
         chunks: list[str] = []
+        tool_calls: list[ToolCall] = []
         for ev in chat_stream(messages, tools=tools, options=options):
             if isinstance(ev, TextDelta):
                 chunks.append(ev.text)
                 if not suppress:
                     self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
+            elif isinstance(ev, ToolCallEvent):
+                tool_calls.append(
+                    ToolCall(
+                        id=ev.id or f"call_{len(tool_calls)}",
+                        name=ev.name,
+                        arguments=ev.arguments,
+                    )
+                )
             elif isinstance(ev, StreamDone):
                 if ev.content and not chunks:
                     # No per-token deltas arrived (result-frame-only path
@@ -395,7 +411,7 @@ class _StreamingProxy:
 
         return ChatResponse(
             content="".join(chunks),
-            tool_calls=(),
+            tool_calls=tuple(tool_calls),
             raw=None,
             dispatched_invocations=dispatched,
         )
