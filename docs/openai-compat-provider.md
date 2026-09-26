@@ -75,9 +75,10 @@ compaction and attunement tiers.
 - **The NellFace model picker is Claude-only** and will refuse to switch
   models for this persona — change `openai_compat.model` instead.
 - **Reasoning models while streaming:** if your server leaves the model's
-  reasoning in the reply text *without* an opening `<think>` tag, it can show
-  up in live chat. Enable your server's reasoning parser (e.g. llama.cpp
-  `--reasoning-format`, vLLM `--reasoning-parser`) so reasoning is sent
-  separately; it is then ignored.
+  reasoning in the reply text *without* an opening `<think>` tag, it can flash
+  up in live chat while she replies. It is stripped from the saved reply, so it
+  is gone when you reopen the conversation. Enable your server's reasoning
+  parser (e.g. llama.cpp `--reasoning-format`, vLLM `--reasoning-parser`) so
+  reasoning is sent separately; it is then ignored.
 - The NellFace setup wizard only creates Claude personas; switch an existing
   persona as above.

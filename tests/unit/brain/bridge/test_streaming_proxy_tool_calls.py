@@ -82,3 +82,16 @@ def test_proxy_collects_tool_call_events_into_the_response():
 def test_proxy_text_only_stream_still_returns_no_tool_calls():
     resp, _ = _run([TextDelta(text="hi"), StreamDone(content="hi")])
     assert resp.tool_calls == ()
+
+
+def test_proxy_returns_authoritative_stream_done_content():
+    """A provider that marks StreamDone.content authoritative (openai-compat's
+    cleaned reply) wins over the joined deltas."""
+    resp, pushed = _run(
+        [
+            TextDelta(text="Hi.\nUser: more"),
+            StreamDone(content="Hi.", metadata={"authoritative_content": True}),
+        ]
+    )
+    assert resp.content == "Hi."
+    assert pushed == ["Hi.\nUser: more"]

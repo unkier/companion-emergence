@@ -52,6 +52,10 @@ def _run_loop(provider, persona_dir: Path):
         hebbian.close()
 
 
+def _sse(*chunks: dict) -> bytes:
+    return ("".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+
+
 def _assert_tool_result_was_sent_back(second_request: dict) -> None:
     messages = second_request["messages"]
     assert messages[-2]["role"] == "assistant"
@@ -84,16 +88,13 @@ def test_round_trip_on_the_chat_path(persona_dir: Path) -> None:
 def test_round_trip_through_the_streaming_proxy(persona_dir: Path) -> None:
     requests: list[dict] = []
 
-    def sse(*chunks: dict) -> bytes:
-        return ("".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
-
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         if len(requests) == 1:
             fragment = {"index": 0, **_TOOL_CALL}
-            body = sse({"choices": [{"delta": {"tool_calls": [fragment]}}]})
+            body = _sse({"choices": [{"delta": {"tool_calls": [fragment]}}]})
         else:
-            body = sse({"choices": [{"delta": {"content": "I feel "}}]}, {"choices": [{"delta": {"content": "steady."}}]})
+            body = _sse({"choices": [{"delta": {"content": "I feel "}}]}, {"choices": [{"delta": {"content": "steady."}}]})
         return httpx.Response(200, content=body)
 
     provider = OpenAICompatProvider(_SETTINGS, "m", None, transport=httpx.MockTransport(handler))
@@ -119,3 +120,35 @@ def test_round_trip_through_the_streaming_proxy(persona_dir: Path) -> None:
     assert "".join(pushed) == "I feel steady."
     assert [inv["name"] for inv in invocations] == ["get_emotional_state"]
     _assert_tool_result_was_sent_back(requests[1])
+
+
+def test_streamed_reply_is_cleaned_before_the_proxy_returns_it() -> None:
+    """A suppressed (recruitable) pass has sent nothing yet, so the text the loop
+    later emits and saves must be the cleaned reply, not the raw stream."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_sse(
+                {"choices": [{"delta": {"content": "I should greet.</think>"}}]},
+                {"choices": [{"delta": {"content": "\n\nHello!\nUser: tell me more\nAssistant: sure"}}]},
+            ),
+        )
+
+    provider = OpenAICompatProvider(_SETTINGS, "m", None, transport=httpx.MockTransport(handler))
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        proxy = _StreamingProxy(provider, q, asyncio.get_running_loop())
+        return await asyncio.to_thread(
+            proxy.chat, _messages(), tools=None, options={"suppress_stream": True}
+        ), q
+
+    loop = asyncio.new_event_loop()
+    try:
+        response, q = loop.run_until_complete(_go())
+    finally:
+        loop.close()
+
+    assert response.content == "Hello!"
+    assert q.empty()

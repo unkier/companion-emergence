@@ -373,6 +373,7 @@ class _StreamingProxy:
 
         chunks: list[str] = []
         tool_calls: list[ToolCall] = []
+        final_content: str | None = None
         for ev in chat_stream(messages, tools=tools, options=options):
             if isinstance(ev, TextDelta):
                 chunks.append(ev.text)
@@ -387,7 +388,12 @@ class _StreamingProxy:
                     )
                 )
             elif isinstance(ev, StreamDone):
-                if ev.content and not chunks:
+                if ev.metadata.get("authoritative_content"):
+                    # The provider cleaned the finished reply (openai-compat:
+                    # reasoning and role-leak stripping). Text already streamed
+                    # can't be recalled, but the loop emits and saves this one.
+                    final_content = ev.content
+                elif ev.content and not chunks:
                     # No per-token deltas arrived (result-frame-only path
                     # or EOF assistant-snapshot fallback). Queue the
                     # content so the WS still emits at least one
@@ -410,7 +416,7 @@ class _StreamingProxy:
             )
 
         return ChatResponse(
-            content="".join(chunks),
+            content="".join(chunks) if final_content is None else final_content,
             tool_calls=tuple(tool_calls),
             raw=None,
             dispatched_invocations=dispatched,

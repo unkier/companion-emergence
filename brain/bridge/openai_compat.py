@@ -489,7 +489,8 @@ class OpenAICompatProvider(LLMProvider):
         yield from events
         self._log_usage("chat_stream", usage, started)
         duration_ms = int((time.monotonic() - started) * 1000)
-        yield StreamDone(content=clean_reply("".join(text)), metadata={"duration_ms": duration_ms})
+        metadata = {"duration_ms": duration_ms, "authoritative_content": True}
+        yield StreamDone(content=clean_reply("".join(text)), metadata=metadata)
 
     # -- internals ----------------------------------------------------------
 
