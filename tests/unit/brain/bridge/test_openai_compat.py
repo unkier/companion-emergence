@@ -14,7 +14,16 @@ import httpx
 import pytest
 
 from brain.bridge import provider_auth
-from brain.bridge.chat import ChatMessage, ImageBlock, TextBlock, ToolCall
+from brain.bridge.chat import (
+    ChatMessage,
+    ImageBlock,
+    StreamDone,
+    StreamError,
+    TextBlock,
+    TextDelta,
+    ToolCall,
+    ToolCallEvent,
+)
 from brain.bridge.openai_compat import (
     API_KEY_ENV,
     SECRETS_FILENAME,
@@ -470,3 +479,165 @@ def test_healthy_is_true_on_models_200_and_false_when_unreachable() -> None:
 
 def test_name_includes_the_model() -> None:
     assert _provider(lambda request: httpx.Response(200)).name() == "openai-compat:main-model"
+
+
+# ── provider: streaming ────────────────────────────────────────────────────
+
+
+def _sse(*chunks: dict, done: bool = True) -> bytes:
+    lines = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
+    if done:
+        lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode("utf-8")
+
+
+def _delta(content: str | None = None, tool_calls: list | None = None) -> dict:
+    delta: dict = {}
+    if content is not None:
+        delta["content"] = content
+    if tool_calls is not None:
+        delta["tool_calls"] = tool_calls
+    return {"choices": [{"index": 0, "delta": delta}]}
+
+
+def _stream(body: bytes, *, status: int = 200, persona_dir: Path | None = None) -> list:
+    handler = lambda request: httpx.Response(  # noqa: E731
+        status, content=body, headers={"content-type": "text/event-stream"}
+    )
+    return list(_provider(handler, persona_dir=persona_dir).chat_stream([_user("hi")]))
+
+
+def _texts(events: list) -> str:
+    return "".join(e.text for e in events if isinstance(e, TextDelta))
+
+
+def test_tool_call_event_id_defaults_to_empty() -> None:
+    assert ToolCallEvent(name="x").id == ""
+
+
+def test_stream_yields_text_deltas_then_done() -> None:
+    events = _stream(_sse(_delta("Hel"), _delta("lo")))
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["Hel", "lo"]
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].content == "Hello"
+
+
+def test_stream_request_sets_stream_and_asks_for_usage() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse(_delta("ok")))
+
+    list(_provider(handler).chat_stream([_user("hi")]))
+    assert seen["body"]["stream"] is True
+    assert seen["body"]["stream_options"] == {"include_usage": True}
+
+
+def test_stream_assembles_a_tool_call_split_across_chunks() -> None:
+    events = _stream(
+        _sse(
+            _delta(tool_calls=[{"index": 0, "id": "c1", "type": "function", "function": {"name": "search_memories", "arguments": ""}}]),
+            _delta(tool_calls=[{"index": 0, "function": {"arguments": '{"query": '}}]),
+            _delta(tool_calls=[{"index": 0, "function": {"arguments": '"tea"}'}}]),
+        )
+    )
+    calls = [e for e in events if isinstance(e, ToolCallEvent)]
+    assert calls == [ToolCallEvent(id="c1", name="search_memories", arguments={"query": "tea"})]
+    assert isinstance(events[-1], StreamDone)
+
+
+def test_stream_yields_parallel_tool_calls_in_index_order() -> None:
+    events = _stream(
+        _sse(
+            _delta(tool_calls=[{"index": 1, "id": "c2", "function": {"name": "get_soul", "arguments": "{}"}}]),
+            _delta(tool_calls=[{"index": 0, "id": "c1", "function": {"name": "get_body_state", "arguments": "{}"}}]),
+        )
+    )
+    assert [e.id for e in events if isinstance(e, ToolCallEvent)] == ["c1", "c2"]
+
+
+def test_stream_tool_fragments_without_index_are_assembled() -> None:
+    """Review Focus 3."""
+    events = _stream(
+        _sse(
+            _delta(tool_calls=[{"id": "c1", "function": {"name": "a", "arguments": "{}"}}]),
+            _delta(tool_calls=[{"id": "c2", "function": {"name": "b", "arguments": '{"x"'}}]),
+            _delta(tool_calls=[{"function": {"arguments": ": 1}"}}]),
+        )
+    )
+    assert [e for e in events if isinstance(e, ToolCallEvent)] == [
+        ToolCallEvent(id="c1", name="a", arguments={}),
+        ToolCallEvent(id="c2", name="b", arguments={"x": 1}),
+    ]
+
+
+def test_stream_no_argument_tool_call_gets_an_empty_dict() -> None:
+    """Review Focus 1 (streaming)."""
+    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "get_emotional_state", "arguments": ""}}])))
+    assert [e for e in events if isinstance(e, ToolCallEvent)] == [
+        ToolCallEvent(id="call_0", name="get_emotional_state", arguments={})
+    ]
+
+
+def test_stream_drops_a_think_span_split_across_chunks() -> None:
+    events = _stream(_sse(_delta("<thi"), _delta("nk>secret plan</th"), _delta("ink>Hi"), _delta(" there")))
+    assert _texts(events) == "Hi there"
+    assert events[-1].content == "Hi there"
+
+
+def test_stream_keeps_text_that_only_looks_like_a_tag_start() -> None:
+    assert _texts(_stream(_sse(_delta("a <th"), _delta("ree")))) == "a <three"
+
+
+def test_stream_ignores_reasoning_content() -> None:
+    reasoning = {"choices": [{"index": 0, "delta": {"reasoning_content": "hmm"}}]}
+    assert _texts(_stream(_sse(reasoning, _delta("Hi")))) == "Hi"
+
+
+def test_stream_skips_keepalive_comments() -> None:
+    assert _texts(_stream(b": ping\n\n" + _sse(_delta("ok")))) == "ok"
+
+
+def test_stream_http_error_yields_a_single_stream_error() -> None:
+    events = _stream(b"boom", status=500)
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].stage == "openai_compat_http"
+    assert "boom" in events[0].detail
+
+
+def test_stream_mid_stream_error_chunk_yields_a_stream_error() -> None:
+    """Review Focus 5 (streaming)."""
+    events = _stream(_sse(_delta("par"), {"error": {"message": "overloaded"}}))
+    assert isinstance(events[-1], StreamError)
+    assert "overloaded" in events[-1].detail
+
+
+def test_stream_invalid_chunk_yields_a_parse_error() -> None:
+    events = _stream(b"data: {nope\n\n")
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].stage == "openai_compat_parse"
+
+
+def test_stream_malformed_tool_arguments_yield_a_parse_error() -> None:
+    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "x", "arguments": "{bad"}}])))
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].stage == "openai_compat_parse"
+
+
+def test_stream_timeout_yields_a_timeout_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("idle", request=request)
+
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(events) == 1
+    assert events[0].stage == "openai_compat_timeout"
+
+
+def test_stream_logs_usage_from_the_final_chunk(tmp_path: Path) -> None:
+    usage_chunk = {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 1}}
+    _stream(_sse(_delta("hi"), usage_chunk), persona_dir=tmp_path)
+    row = json.loads((tmp_path / "chat_usage.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["call_type"] == "chat_stream"
+    assert (row["input_tokens"], row["output_tokens"]) == (5, 1)

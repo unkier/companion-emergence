@@ -249,11 +249,13 @@ class ToolCallEvent:
 
     Most Claude CLI tool calls are dispatched inside the subprocess
     and surface via ``ChatResponse.dispatched_invocations`` after the
-    stream completes; this event type is reserved for providers (or
-    future Claude CLI versions) that expose tool calls in-line as
-    they happen.
+    stream completes; this event type is for providers (openai-compat)
+    that hand tool calls back to ``run_tool_loop`` for in-process
+    dispatch. ``id`` is the provider's call id — the tool result is
+    linked back to it — and is empty when the provider sent none.
     """
 
+    id: str = ""
     name: str = ""
     arguments: dict[str, Any] = field(default_factory=dict)
     kind: Literal["tool_call"] = field(default="tool_call", init=False)

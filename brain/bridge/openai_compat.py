@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,18 @@ from typing import Any
 import httpx
 
 from brain.bridge import provider_auth
-from brain.bridge.chat import ChatMessage, ChatResponse, ImageBlock, TextBlock, ToolCall
+from brain.bridge.chat import (
+    ChatMessage,
+    ChatResponse,
+    ChatStreamEvent,
+    ImageBlock,
+    StreamDone,
+    StreamError,
+    TextBlock,
+    TextDelta,
+    ToolCall,
+    ToolCallEvent,
+)
 from brain.bridge.model_tier import (
     TIER_ATTUNEMENT_DETECTOR,
     TIER_BACKGROUND_CLASSIFIER,
@@ -398,6 +410,87 @@ class OpenAICompatProvider(LLMProvider):
     ) -> ChatResponse:
         return self._complete(messages, tools=tools, options=options, call_type="chat")
 
+    def chat_stream(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> Iterator[ChatStreamEvent]:
+        """Stream a reply: TextDelta…, then ToolCallEvent…, then StreamDone.
+
+        On failure yields one StreamError and stops. ``timeout_s`` is applied as
+        httpx's read timeout, so it bounds the gap between chunks, not the total.
+        """
+        payload = self._payload(messages, tools, options, stream=True)
+        url = self._url("/chat/completions")
+        started = time.monotonic()
+        think = _ThinkFilter()
+        text: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        usage: object = None
+        try:
+            with (
+                self._client(timeout=self._settings.timeout_s) as client,
+                client.stream("POST", url, json=payload) as resp,
+            ):
+                if not resp.is_success:
+                    body = resp.read().decode("utf-8", "replace")
+                    detail = http_error_detail(resp.status_code, url, body)
+                    yield StreamError(stage="openai_compat_http", detail=detail)
+                    return
+                for data in _sse_data(resp.iter_lines()):
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        detail = f"invalid stream chunk from {url}: {data[:200]}"
+                        yield StreamError(stage="openai_compat_parse", detail=detail)
+                        return
+                    if not isinstance(chunk, dict):
+                        continue
+                    if chunk.get("error"):
+                        detail = f"endpoint error mid-stream: {json.dumps(chunk['error'])[:200]}"
+                        yield StreamError(stage="openai_compat_http", detail=detail)
+                        return
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") if isinstance(choice, dict) else None
+                        if not isinstance(delta, dict):
+                            continue
+                        piece = delta.get("content")
+                        if isinstance(piece, str) and piece:
+                            visible = think.feed(piece)
+                            if visible:
+                                text.append(visible)
+                                yield TextDelta(text=visible)
+                        for fragment in delta.get("tool_calls") or []:
+                            if isinstance(fragment, dict):
+                                _merge_tool_fragment(calls, fragment)
+        except httpx.TimeoutException:
+            detail = f"no data from {url} for {self._settings.timeout_s:g}s"
+            yield StreamError(stage="openai_compat_timeout", detail=detail)
+            return
+        except httpx.RequestError as exc:
+            detail = f"cannot reach {url}: {type(exc).__name__}: {exc}"
+            yield StreamError(stage="openai_compat_request", detail=detail)
+            return
+        tail = think.flush()
+        if tail:
+            text.append(tail)
+            yield TextDelta(text=tail)
+        try:
+            events = [_tool_call_event(index, calls[index]) for index in sorted(calls)]
+        except ProviderError as exc:
+            yield StreamError(stage=exc.stage, detail=exc.detail)
+            return
+        yield from events
+        self._log_usage("chat_stream", usage, started)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        yield StreamDone(content=clean_reply("".join(text)), metadata={"duration_ms": duration_ms})
+
     # -- internals ----------------------------------------------------------
 
     def _url(self, path: str) -> str:
@@ -549,3 +642,100 @@ def _parse_tool_call(raw: object, index: int) -> ToolCall:
         return ToolCall.from_provider_dict(normalized)
     except ValueError as exc:
         raise ProviderError("openai_compat_parse", f"malformed tool_call in response: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Streaming helpers
+# ---------------------------------------------------------------------------
+
+
+def _sse_data(lines: Iterator[str]) -> Iterator[str]:
+    """The ``data:`` payloads of an SSE stream; comments and keep-alives are skipped."""
+    for line in lines:
+        if line.startswith("data:"):
+            yield line[len("data:") :].strip()
+
+
+def _merge_tool_fragment(calls: dict[int, dict[str, str]], fragment: dict[str, Any]) -> None:
+    """Fold one streamed tool-call fragment into ``calls`` (keyed by index)."""
+    if isinstance(fragment.get("index"), int):
+        index = fragment["index"]
+    elif fragment.get("id") or not calls:
+        index = len(calls)  # no index: a fragment with an id starts a new call
+    else:
+        index = max(calls)  # no index, no id: it continues the latest call
+    slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+    if fragment.get("id"):
+        slot["id"] = str(fragment["id"])
+    function = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+    if function.get("name") and not slot["name"]:
+        slot["name"] = str(function["name"])
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        slot["arguments"] += arguments
+    elif isinstance(arguments, dict):
+        slot["arguments"] = json.dumps(arguments)
+
+
+def _tool_call_event(index: int, slot: dict[str, str]) -> ToolCallEvent:
+    if not slot["name"]:
+        raise ProviderError("openai_compat_parse", f"streamed tool call #{index} has no name")
+    raw = slot["arguments"].strip() or "{}"
+    try:
+        arguments = json.loads(raw)
+    except ValueError as exc:
+        raise ProviderError(
+            "openai_compat_parse",
+            f"streamed tool call {slot['name']!r} has invalid JSON arguments: {raw[:200]}",
+        ) from exc
+    if not isinstance(arguments, dict):
+        raise ProviderError(
+            "openai_compat_parse", f"streamed tool call {slot['name']!r} arguments are not an object"
+        )
+    return ToolCallEvent(id=slot["id"] or f"call_{index}", name=slot["name"], arguments=arguments)
+
+
+class _ThinkFilter:
+    """Drop ``<think>…</think>`` spans from streamed text, across chunk boundaries."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._inside = False
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk
+        visible: list[str] = []
+        while True:
+            if self._inside:
+                end = self._buffer.find(_THINK_CLOSE)
+                if end == -1:
+                    # Keep only a tail that could be the start of </think>.
+                    self._buffer = self._buffer[-(len(_THINK_CLOSE) - 1) :]
+                    break
+                self._buffer = self._buffer[end + len(_THINK_CLOSE) :]
+                self._inside = False
+            else:
+                start = self._buffer.find(_THINK_OPEN)
+                if start == -1:
+                    keep = _partial_tag_suffix(self._buffer, _THINK_OPEN)
+                    safe = len(self._buffer) - keep
+                    visible.append(self._buffer[:safe])
+                    self._buffer = self._buffer[safe:]
+                    break
+                visible.append(self._buffer[:start])
+                self._buffer = self._buffer[start + len(_THINK_OPEN) :]
+                self._inside = True
+        return "".join(visible)
+
+    def flush(self) -> str:
+        rest = "" if self._inside else self._buffer
+        self._buffer = ""
+        return rest
+
+
+def _partial_tag_suffix(text: str, tag: str) -> int:
+    """Length of the longest end of ``text`` that is a proper prefix of ``tag``."""
+    for size in range(min(len(tag) - 1, len(text)), 0, -1):
+        if text.endswith(tag[:size]):
+            return size
+    return 0
