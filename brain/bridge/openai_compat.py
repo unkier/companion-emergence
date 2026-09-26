@@ -16,11 +16,15 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from brain.bridge.chat import ChatMessage, ImageBlock, TextBlock
+import httpx
+
+from brain.bridge import provider_auth
+from brain.bridge.chat import ChatMessage, ChatResponse, ImageBlock, TextBlock, ToolCall
 from brain.bridge.model_tier import (
     TIER_ATTUNEMENT_DETECTOR,
     TIER_BACKGROUND_CLASSIFIER,
@@ -33,9 +37,11 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import (
     _PROVIDER_CONTEXT_OPTION_KEYS,
+    LLMProvider,
     ProviderError,
     _truncate_at_role_leak,
 )
+from brain.bridge.usage_log import log_usage
 from brain.images import read_image_bytes
 
 logger = logging.getLogger(__name__)
@@ -336,3 +342,210 @@ def clean_reply(text: str) -> str:
     if open_at != -1:
         text = text[:open_at]
     return _truncate_at_role_leak(text.strip())
+
+
+# ---------------------------------------------------------------------------
+# Provider
+# ---------------------------------------------------------------------------
+
+
+class OpenAICompatProvider(LLMProvider):
+    """LLMProvider for any OpenAI-compatible ``/chat/completions`` endpoint."""
+
+    def __init__(
+        self,
+        settings: OpenAICompatSettings,
+        model: str,
+        api_key: str | None = None,
+        *,
+        persona_dir: Path | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self._settings = settings
+        self._model = model
+        self._api_key = api_key
+        self._persona_dir = persona_dir
+        self._transport = transport
+
+    @property
+    def base_url(self) -> str:
+        return self._settings.base_url
+
+    def name(self) -> str:
+        return f"{PROVIDER_NAME}:{self._model}"
+
+    def healthy(self) -> bool:
+        """``GET {base_url}/models`` — True when the endpoint answers 2xx."""
+        try:
+            with self._client(timeout=5.0) as client:
+                return client.get(self._url("/models")).is_success
+        except httpx.HTTPError:
+            return False
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        messages: list[ChatMessage] = []
+        if system:
+            messages.append(ChatMessage(role="system", content=system))
+        messages.append(ChatMessage(role="user", content=prompt))
+        return self._complete(messages, tools=None, options=None, call_type="generate").content
+
+    def chat(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> ChatResponse:
+        return self._complete(messages, tools=tools, options=options, call_type="chat")
+
+    # -- internals ----------------------------------------------------------
+
+    def _url(self, path: str) -> str:
+        return f"{self._settings.base_url}{path}"
+
+    def _client(self, *, timeout: float) -> httpx.Client:
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        # trust_env=False: a stray proxy env var must not reroute her LLM traffic.
+        return httpx.Client(
+            headers=headers, timeout=timeout, transport=self._transport, trust_env=False
+        )
+
+    def _payload(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        options: dict[str, Any] | None,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": to_openai_messages(
+                messages,
+                vision=self._settings.vision,
+                persona_dir=self._persona_dir,
+                volatile_suffix=(options or {}).get("volatile_suffix"),
+            ),
+            "stream": stream,
+            **generation_params(options),
+        }
+        if tools:
+            payload["tools"] = tools
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        return payload
+
+    def _complete(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None,
+        options: dict[str, Any] | None,
+        call_type: str,
+    ) -> ChatResponse:
+        started = time.monotonic()
+        data = self._post(self._payload(messages, tools, options, stream=False))
+        message = _first_message(data)
+        raw_calls = message.get("tool_calls")
+        tool_calls = tuple(
+            _parse_tool_call(raw, index)
+            for index, raw in enumerate(raw_calls if isinstance(raw_calls, list) else [])
+        )
+        content = message.get("content")
+        self._log_usage(call_type, data.get("usage"), started)
+        return ChatResponse(
+            content=clean_reply(content if isinstance(content, str) else ""),
+            tool_calls=tool_calls,
+            raw=data,
+        )
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = self._url("/chat/completions")
+        try:
+            with self._client(timeout=self._settings.timeout_s) as client:
+                resp = client.post(url, json=payload)
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                "openai_compat_timeout",
+                f"no response from {url} within {self._settings.timeout_s:g}s",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ProviderError(
+                "openai_compat_request", f"cannot reach {url}: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not resp.is_success:
+            raise ProviderError(
+                "openai_compat_http", http_error_detail(resp.status_code, url, resp.text)
+            )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError(
+                "openai_compat_parse", f"invalid JSON from {url}: {resp.text[:200]}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ProviderError("openai_compat_parse", f"response from {url} is not a JSON object")
+        return data
+
+    def _log_usage(self, call_type: str, usage: object, started: float) -> None:
+        if self._persona_dir is None:
+            return
+        usage = usage if isinstance(usage, dict) else {}
+        details = usage.get("prompt_tokens_details")
+        log_usage(
+            self._persona_dir,
+            call_type=call_type,
+            model=self._model,
+            frame={
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens"),
+                    "output_tokens": usage.get("completion_tokens"),
+                    "cache_read_input_tokens": (
+                        details.get("cached_tokens") if isinstance(details, dict) else None
+                    ),
+                },
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            },
+        )
+
+
+def http_error_detail(status: int, url: str, body: str) -> str:
+    """Human-readable detail for a non-2xx response.
+
+    Never contains the provider_auth markers, so an endpoint auth failure can't
+    set off the Claude re-login flow.
+    """
+    excerpt = body.strip()[:200]
+    if provider_auth.is_auth_failure(excerpt):
+        excerpt = "(response body omitted)"
+    if status in (401, 403):
+        return (
+            f"rejected by endpoint (HTTP {status}) — check the API key in the persona's "
+            f"{SECRETS_FILENAME} or ${API_KEY_ENV}: {excerpt}"
+        )
+    return f"HTTP {status} from {url}: {excerpt}"
+
+
+def _first_message(data: dict[str, Any]) -> dict[str, Any]:
+    choices = data.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict):
+        error = data.get("error")
+        hint = f" (endpoint error: {json.dumps(error)[:200]})" if error else ""
+        raise ProviderError("openai_compat_parse", f"response has no choices[0].message{hint}")
+    return message
+
+
+def _parse_tool_call(raw: object, index: int) -> ToolCall:
+    """Normalize one tool call (missing id, empty arguments) and parse it."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("function"), dict):
+        raise ProviderError("openai_compat_parse", f"malformed tool_call in response: {raw!r}"[:300])
+    function = dict(raw["function"])
+    if function.get("arguments") in (None, ""):
+        function["arguments"] = "{}"
+    normalized = {"id": raw.get("id") or f"call_{index}", "function": function}
+    try:
+        return ToolCall.from_provider_dict(normalized)
+    except ValueError as exc:
+        raise ProviderError("openai_compat_parse", f"malformed tool_call in response: {exc}") from exc

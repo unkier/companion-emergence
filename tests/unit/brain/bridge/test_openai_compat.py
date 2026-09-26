@@ -10,12 +10,15 @@ import stat
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
+from brain.bridge import provider_auth
 from brain.bridge.chat import ChatMessage, ImageBlock, TextBlock, ToolCall
 from brain.bridge.openai_compat import (
     API_KEY_ENV,
     SECRETS_FILENAME,
+    OpenAICompatProvider,
     OpenAICompatSettings,
     clean_reply,
     generation_params,
@@ -275,3 +278,195 @@ def test_generation_params_forward_only_the_allow_list() -> None:
 )
 def test_clean_reply(raw: str, expected: str) -> None:
     assert clean_reply(raw) == expected
+
+
+# ── provider: non-streaming ────────────────────────────────────────────────
+
+
+def _provider(
+    handler,
+    *,
+    api_key: str | None = None,
+    persona_dir: Path | None = None,
+    **block: object,
+) -> OpenAICompatProvider:
+    settings = OpenAICompatSettings.from_config({**_MIN_BLOCK, **block})
+    return OpenAICompatProvider(
+        settings,
+        "main-model",
+        api_key,
+        persona_dir=persona_dir,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def _completion(content: str | None = "hi", tool_calls: list | None = None, usage: dict | None = None) -> dict:
+    message: dict = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    body: dict = {"choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
+    if usage is not None:
+        body["usage"] = usage
+    return body
+
+
+def test_chat_posts_to_chat_completions_and_returns_content() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=_completion("Hello there"))
+
+    resp = _provider(handler).chat([_user("hi")])
+    assert resp.content == "Hello there"
+    assert resp.tool_calls == ()
+    assert seen["url"] == "http://localhost:1234/v1/chat/completions"
+    assert seen["body"]["model"] == "main-model"
+    assert seen["body"]["stream"] is False
+    assert "tools" not in seen["body"]
+    assert seen["auth"] is None
+
+
+def test_api_key_is_sent_as_a_bearer_token() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json=_completion())
+
+    _provider(handler, api_key="sk-test").chat([_user("hi")])
+    assert seen["auth"] == "Bearer sk-test"
+
+
+def test_tools_pass_through_and_tool_calls_are_parsed() -> None:
+    tools = [{"type": "function", "function": {"name": "search_memories", "parameters": {"type": "object", "properties": {}}}}]
+    raw_call = {"id": "c1", "type": "function", "function": {"name": "search_memories", "arguments": '{"query": "tea"}'}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["tools"] == tools
+        return httpx.Response(200, json=_completion(None, tool_calls=[raw_call]))
+
+    resp = _provider(handler).chat([_user("hi")], tools=tools)
+    assert resp.content == ""
+    assert resp.tool_calls == (ToolCall(id="c1", name="search_memories", arguments={"query": "tea"}),)
+
+
+@pytest.mark.parametrize("function", [{"name": "get_emotional_state", "arguments": ""}, {"name": "get_emotional_state"}])
+def test_no_argument_tool_call_normalizes_to_an_empty_dict(function: dict) -> None:
+    """Review Focus 1: servers send "" (or nothing) for parameterless tools."""
+    handler = lambda request: httpx.Response(200, json=_completion(None, tool_calls=[{"type": "function", "function": function}]))  # noqa: E731
+    resp = _provider(handler).chat([_user("hi")])
+    assert resp.tool_calls == (ToolCall(id="call_0", name="get_emotional_state", arguments={}),)
+
+
+def test_malformed_tool_call_arguments_raise_a_parse_error() -> None:
+    raw_call = {"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{not json"}}
+    handler = lambda request: httpx.Response(200, json=_completion(None, tool_calls=[raw_call]))  # noqa: E731
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert info.value.stage == "openai_compat_parse"
+
+
+def test_http_200_with_an_error_body_raises_a_parse_error_quoting_it() -> None:
+    """Review Focus 5."""
+    handler = lambda request: httpx.Response(200, json={"error": {"message": "model not loaded"}})  # noqa: E731
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert info.value.stage == "openai_compat_parse"
+    assert "model not loaded" in info.value.detail
+
+
+def test_http_404_detail_names_the_full_url() -> None:
+    """Review Focus 4: a base_url missing /v1 shows up as a 404 on a visible URL."""
+    handler = lambda request: httpx.Response(404, text="Not Found")  # noqa: E731
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert info.value.stage == "openai_compat_http"
+    assert "http://localhost:1234/v1/chat/completions" in info.value.detail
+    assert "404" in info.value.detail
+
+
+def test_http_401_detail_points_at_the_key_and_never_trips_claude_auth_markers() -> None:
+    body = {"error": {"message": "Failed to authenticate. Not logged in."}}
+    handler = lambda request: httpx.Response(401, json=body)  # noqa: E731
+    with pytest.raises(ProviderError) as info:
+        _provider(handler, api_key="sk-secret").chat([_user("hi")])
+    detail = info.value.detail
+    assert info.value.stage == "openai_compat_http"
+    assert SECRETS_FILENAME in detail
+    assert API_KEY_ENV in detail
+    assert not provider_auth.is_auth_failure(detail)
+    assert "sk-secret" not in detail
+
+
+def test_connection_failure_raises_a_request_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert info.value.stage == "openai_compat_request"
+
+
+def test_timeout_raises_a_timeout_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert info.value.stage == "openai_compat_timeout"
+
+
+def test_generate_sends_system_and_user_and_logs_usage(tmp_path: Path) -> None:
+    seen: dict = {}
+    usage = {"prompt_tokens": 12, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 8}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["messages"] = json.loads(request.content)["messages"]
+        return httpx.Response(200, json=_completion("done", usage=usage))
+
+    assert _provider(handler, persona_dir=tmp_path).generate("prompt", system="sys") == "done"
+    assert seen["messages"] == [{"role": "system", "content": "sys"}, {"role": "user", "content": "prompt"}]
+    row = json.loads((tmp_path / "chat_usage.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["call_type"] == "generate"
+    assert row["model"] == "main-model"
+    assert (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"]) == (12, 3, 8)
+
+
+def test_chat_strips_context_options_and_applies_the_volatile_suffix() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion())
+
+    options = {"persona_dir": "/x", "session_id": "s", "volatile_suffix": "CTX", "temperature": 0.2}
+    _provider(handler).chat([_sys("s"), _user("hi")], options=options)
+    body = seen["body"]
+    assert "persona_dir" not in body
+    assert "session_id" not in body
+    assert body["temperature"] == 0.2
+    assert body["messages"][-1]["content"] == "hi\n\nCTX"
+
+
+def test_reply_reasoning_is_stripped() -> None:
+    handler = lambda request: httpx.Response(200, json=_completion("<think>x</think>Hi"))  # noqa: E731
+    assert _provider(handler).chat([_user("hi")]).content == "Hi"
+
+
+def test_healthy_is_true_on_models_200_and_false_when_unreachable() -> None:
+    def ok(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": []})
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    assert _provider(ok).healthy() is True
+    assert _provider(down).healthy() is False
+
+
+def test_name_includes_the_model() -> None:
+    assert _provider(lambda request: httpx.Response(200)).name() == "openai-compat:main-model"
