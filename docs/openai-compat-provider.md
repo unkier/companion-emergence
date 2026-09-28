@@ -54,6 +54,11 @@ gateway such as OpenRouter or Polza reporting that the upstream provider it
 picked failed — is retried once after a second. A streamed reply is only
 retried if nothing has been shown yet. Timeouts are not retried.
 
+Some models call a tool even on a request that offers none, such as the final
+reply after her tool budget is spent. That call is dropped. If it was the whole
+reply, the request is sent once more with a note asking for words. A second
+tool-only answer is reported as an empty reply.
+
 ### Tiers
 
 | Tier | What runs on it |

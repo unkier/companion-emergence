@@ -320,6 +320,9 @@ def _completion(content: str | None = "hi", tool_calls: list | None = None, usag
     return body
 
 
+_TOOLS = [{"type": "function", "function": {"name": "record_monologue", "parameters": {"type": "object", "properties": {}}}}]
+
+
 def test_chat_posts_to_chat_completions_and_returns_content() -> None:
     seen: dict = {}
 
@@ -367,7 +370,7 @@ def test_tools_pass_through_and_tool_calls_are_parsed() -> None:
 def test_no_argument_tool_call_normalizes_to_an_empty_dict(function: dict) -> None:
     """Review Focus 1: servers send "" (or nothing) for parameterless tools."""
     handler = lambda request: httpx.Response(200, json=_completion(None, tool_calls=[{"type": "function", "function": function}]))  # noqa: E731
-    resp = _provider(handler).chat([_user("hi")])
+    resp = _provider(handler).chat([_user("hi")], tools=_TOOLS)
     assert resp.tool_calls == (ToolCall(id="call_0", name="get_emotional_state", arguments={}),)
 
 
@@ -501,11 +504,13 @@ def _delta(content: str | None = None, tool_calls: list | None = None) -> dict:
     return {"choices": [{"index": 0, "delta": delta}]}
 
 
-def _stream(body: bytes, *, status: int = 200, persona_dir: Path | None = None) -> list:
+def _stream(
+    body: bytes, *, status: int = 200, persona_dir: Path | None = None, tools: list | None = None
+) -> list:
     handler = lambda request: httpx.Response(  # noqa: E731
         status, content=body, headers={"content-type": "text/event-stream"}
     )
-    return list(_provider(handler, persona_dir=persona_dir).chat_stream([_user("hi")]))
+    return list(_provider(handler, persona_dir=persona_dir).chat_stream([_user("hi")], tools=tools))
 
 
 def _texts(events: list) -> str:
@@ -541,7 +546,8 @@ def test_stream_assembles_a_tool_call_split_across_chunks() -> None:
             _delta(tool_calls=[{"index": 0, "id": "c1", "type": "function", "function": {"name": "search_memories", "arguments": ""}}]),
             _delta(tool_calls=[{"index": 0, "function": {"arguments": '{"query": '}}]),
             _delta(tool_calls=[{"index": 0, "function": {"arguments": '"tea"}'}}]),
-        )
+        ),
+        tools=_TOOLS,
     )
     calls = [e for e in events if isinstance(e, ToolCallEvent)]
     assert calls == [ToolCallEvent(id="c1", name="search_memories", arguments={"query": "tea"})]
@@ -553,7 +559,8 @@ def test_stream_yields_parallel_tool_calls_in_index_order() -> None:
         _sse(
             _delta(tool_calls=[{"index": 1, "id": "c2", "function": {"name": "get_soul", "arguments": "{}"}}]),
             _delta(tool_calls=[{"index": 0, "id": "c1", "function": {"name": "get_body_state", "arguments": "{}"}}]),
-        )
+        ),
+        tools=_TOOLS,
     )
     assert [e.id for e in events if isinstance(e, ToolCallEvent)] == ["c1", "c2"]
 
@@ -565,7 +572,8 @@ def test_stream_tool_fragments_without_index_are_assembled() -> None:
             _delta(tool_calls=[{"id": "c1", "function": {"name": "a", "arguments": "{}"}}]),
             _delta(tool_calls=[{"id": "c2", "function": {"name": "b", "arguments": '{"x"'}}]),
             _delta(tool_calls=[{"function": {"arguments": ": 1}"}}]),
-        )
+        ),
+        tools=_TOOLS,
     )
     assert [e for e in events if isinstance(e, ToolCallEvent)] == [
         ToolCallEvent(id="c1", name="a", arguments={}),
@@ -575,7 +583,7 @@ def test_stream_tool_fragments_without_index_are_assembled() -> None:
 
 def test_stream_no_argument_tool_call_gets_an_empty_dict() -> None:
     """Review Focus 1 (streaming)."""
-    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "get_emotional_state", "arguments": ""}}])))
+    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "get_emotional_state", "arguments": ""}}])), tools=_TOOLS)
     assert [e for e in events if isinstance(e, ToolCallEvent)] == [
         ToolCallEvent(id="call_0", name="get_emotional_state", arguments={})
     ]
@@ -622,7 +630,7 @@ def test_stream_invalid_chunk_yields_a_parse_error() -> None:
 
 
 def test_stream_malformed_tool_arguments_yield_a_parse_error() -> None:
-    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "x", "arguments": "{bad"}}])))
+    events = _stream(_sse(_delta(tool_calls=[{"index": 0, "function": {"name": "x", "arguments": "{bad"}}])), tools=_TOOLS)
     assert isinstance(events[-1], StreamError)
     assert events[-1].stage == "openai_compat_parse"
 
@@ -651,7 +659,8 @@ def test_stream_no_index_fragments_repeating_the_same_id_are_one_call() -> None:
             _delta(tool_calls=[{"id": "c1", "function": {"name": "search_memories", "arguments": ""}}]),
             _delta(tool_calls=[{"id": "c1", "function": {"arguments": '{"query": '}}]),
             _delta(tool_calls=[{"id": "c1", "function": {"arguments": '"tea"}'}}]),
-        )
+        ),
+        tools=_TOOLS,
     )
     assert [e for e in events if isinstance(e, ToolCallEvent)] == [
         ToolCallEvent(id="c1", name="search_memories", arguments={"query": "tea"})
@@ -675,7 +684,7 @@ def test_stream_recovers_a_plain_json_completion_when_the_server_ignores_stream(
 
 def test_stream_recovers_tool_calls_from_a_plain_json_completion() -> None:
     call = {"id": "c1", "type": "function", "function": {"name": "get_soul", "arguments": ""}}
-    events = _stream(json.dumps(_completion(None, tool_calls=[call])).encode())
+    events = _stream(json.dumps(_completion(None, tool_calls=[call])).encode(), tools=_TOOLS)
     assert [e for e in events if isinstance(e, ToolCallEvent)] == [
         ToolCallEvent(id="c1", name="get_soul", arguments={})
     ]
@@ -870,6 +879,114 @@ def test_stream_gives_up_after_one_retry() -> None:
     assert len(events) == 1
     assert isinstance(events[0], StreamError)
     assert "still down" in events[0].detail
+
+
+# ── tool calls on a request that offered no tools ──────────────────────────
+
+_MONOLOGUE_FRAGMENT = {
+    "index": 0,
+    "id": "c1",
+    "type": "function",
+    "function": {"name": "record_monologue", "arguments": '{"monologue": "hm"}'},
+}
+_MONOLOGUE_CALL = {k: v for k, v in _MONOLOGUE_FRAGMENT.items() if k != "index"}
+
+
+def _sent_messages(request: httpx.Request) -> list[dict]:
+    return json.loads(request.content)["messages"]
+
+
+_REMINDER_MESSAGE = {"role": "user", "content": openai_compat._NO_TOOLS_REMINDER}
+
+
+def test_stream_without_tools_drops_a_tool_call_that_came_with_text() -> None:
+    events = _stream(_sse(_delta("hello", tool_calls=[_MONOLOGUE_FRAGMENT])))
+    assert not any(isinstance(e, ToolCallEvent) for e in events)
+    assert _texts(events) == "hello"
+    assert events[-1] == StreamDone(content="hello", metadata=events[-1].metadata)
+
+
+def test_stream_without_tools_retries_a_tool_only_reply_with_a_reminder() -> None:
+    handler, calls = _flaky(
+        httpx.Response(200, content=_sse(_delta(tool_calls=[_MONOLOGUE_FRAGMENT]))),
+        httpx.Response(200, content=_sse(_delta("hello"))),
+    )
+    events = list(_provider(handler).chat_stream([_user("how are you?")]))
+    assert len(calls) == 2
+    assert _texts(events) == "hello"
+    assert not any(isinstance(e, (ToolCallEvent, StreamError)) for e in events)
+    assert _sent_messages(calls[1]) == [*_sent_messages(calls[0]), _REMINDER_MESSAGE]
+
+
+def test_stream_without_tools_reports_a_repeated_tool_only_reply() -> None:
+    handler, calls = _flaky(
+        httpx.Response(200, content=_sse(_delta(tool_calls=[_MONOLOGUE_FRAGMENT]))),
+        httpx.Response(200, content=_sse(_delta(tool_calls=[_MONOLOGUE_FRAGMENT]))),
+    )
+    events = list(_provider(handler).chat_stream([_user("hi")]))
+    assert len(calls) == 2
+    assert len(events) == 1
+    assert isinstance(events[0], StreamError)
+    assert events[0].stage == "openai_compat_empty"
+    assert "record_monologue" in events[0].detail
+
+
+def test_stream_with_tools_still_returns_a_tool_only_reply() -> None:
+    handler, calls = _flaky(
+        httpx.Response(200, content=_sse(_delta(tool_calls=[_MONOLOGUE_FRAGMENT]))),
+        httpx.Response(200, content=_sse(_delta("unused"))),
+    )
+    events = list(_provider(handler).chat_stream([_user("hi")], tools=_TOOLS))
+    assert len(calls) == 1
+    assert [e.name for e in events if isinstance(e, ToolCallEvent)] == ["record_monologue"]
+
+
+def test_chat_without_tools_drops_a_tool_call_that_came_with_text() -> None:
+    body = _completion("hello", tool_calls=[_MONOLOGUE_CALL])
+    resp = _provider(lambda request: httpx.Response(200, json=body)).chat([_user("hi")])
+    assert resp.content == "hello"
+    assert resp.tool_calls == ()
+
+
+def test_chat_without_tools_retries_a_tool_only_reply_with_a_reminder() -> None:
+    handler, calls = _flaky(
+        httpx.Response(200, json=_completion(None, tool_calls=[_MONOLOGUE_CALL])),
+        httpx.Response(200, json=_completion("hello")),
+    )
+    resp = _provider(handler).chat([_user("how are you?")])
+    assert len(calls) == 2
+    assert resp.content == "hello"
+    assert resp.tool_calls == ()
+    assert _sent_messages(calls[1]) == [*_sent_messages(calls[0]), _REMINDER_MESSAGE]
+
+
+def test_chat_without_tools_raises_on_a_repeated_tool_only_reply() -> None:
+    handler, calls = _flaky(
+        httpx.Response(200, json=_completion(None, tool_calls=[_MONOLOGUE_CALL])),
+        httpx.Response(200, json=_completion(None, tool_calls=[_MONOLOGUE_CALL])),
+    )
+    with pytest.raises(ProviderError) as info:
+        _provider(handler).chat([_user("hi")])
+    assert len(calls) == 2
+    assert info.value.stage == "openai_compat_empty"
+    assert "record_monologue" in info.value.detail
+
+
+def test_the_unoffered_tool_retry_log_redacts_the_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger="brain.bridge.openai_compat")
+    handler, _ = _flaky(
+        httpx.Response(200, json=_completion(None, tool_calls=[_MONOLOGUE_CALL])),
+        httpx.Response(200, json=_completion("hello")),
+    )
+    url = "http://localhost:1234/sk-leaky/v1/"
+    _provider(handler, api_key="sk-leaky", base_url=url).chat([_user("hi")])
+    stream_handler, _ = _flaky(
+        httpx.Response(200, content=_sse(_delta(tool_calls=[_MONOLOGUE_FRAGMENT]))),
+        httpx.Response(200, content=_sse(_delta("hello"))),
+    )
+    list(_provider(stream_handler, api_key="sk-leaky", base_url=url).chat_stream([_user("hi")]))
+    assert caplog.text.count("asking once more for words") == 2
+    assert "sk-leaky" not in caplog.text
 
 
 # ── factory ────────────────────────────────────────────────────────────────

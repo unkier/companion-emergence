@@ -425,9 +425,11 @@ class OpenAICompatProvider(LLMProvider):
         is applied as httpx's read timeout, so it bounds the gap between chunks,
         not the total.
         """
+        reminder = False
         for attempt in (1, 2):
             streamed = False
-            with closing(self._stream_events(messages, tools, options)) as events:
+            events = self._stream_events(messages, tools, options, reminder=reminder)
+            with closing(events):
                 for event in events:
                     if isinstance(event, _Transient):
                         if attempt == 1 and not streamed:
@@ -442,15 +444,21 @@ class OpenAICompatProvider(LLMProvider):
                 else:
                     return
             # Only the break on a first-attempt _Transient gets here.
-            self._pause_before_retry(event.error.detail)
+            if isinstance(event, _UnofferedToolCall):
+                self._log_reminder_retry(event.error.detail)
+                reminder = True
+            else:
+                self._pause_before_retry(event.error.detail)
 
     def _stream_events(
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None,
         options: dict[str, Any] | None,
+        *,
+        reminder: bool,
     ) -> Iterator[ChatStreamEvent]:
-        payload = self._payload(messages, tools, options, stream=True)
+        payload = self._payload(messages, tools, options, stream=True, reminder=reminder)
         url = self._url("/chat/completions")
         started = time.monotonic()
         think = _ThinkFilter()
@@ -516,12 +524,15 @@ class OpenAICompatProvider(LLMProvider):
             yield StreamError(stage="openai_compat_request", detail=detail)
             return
         if not saw_data:
-            yield from self._non_sse_reply(url, other, started)
+            yield from self._non_sse_reply(url, other, started, offered=bool(tools))
             return
         tail = think.flush()
         if tail:
             text.append(tail)
             yield TextDelta(text=tail)
+        unoffered = [] if tools else [calls[index]["name"] or "unnamed" for index in sorted(calls)]
+        if unoffered:
+            calls = {}
         try:
             events = [_tool_call_event(index, calls[index]) for index in sorted(calls)]
         except ProviderError as exc:
@@ -529,6 +540,10 @@ class OpenAICompatProvider(LLMProvider):
             return
         self._log_usage("chat_stream", usage, started)
         content = clean_reply("".join(text))
+        if not content and unoffered:
+            detail = _unoffered_tool_detail(url, unoffered)
+            yield _UnofferedToolCall(StreamError(stage="openai_compat_empty", detail=detail))
+            return
         if not content and not events:
             reason = f" (finish_reason: {finish_reason})" if finish_reason else ""
             yield StreamError(stage="openai_compat_empty", detail=f"empty reply from {url}{reason}")
@@ -536,7 +551,9 @@ class OpenAICompatProvider(LLMProvider):
         yield from events
         yield _stream_done(content, started)
 
-    def _non_sse_reply(self, url: str, lines: list[str], started: float) -> Iterator[ChatStreamEvent]:
+    def _non_sse_reply(
+        self, url: str, lines: list[str], started: float, *, offered: bool
+    ) -> Iterator[ChatStreamEvent]:
         """Read a 200 reply that carried no SSE data: a server that ignored
         ``stream: true`` (recovered as-is), a JSON error body, or nothing at all."""
         body = "\n".join(lines).strip()
@@ -554,6 +571,12 @@ class OpenAICompatProvider(LLMProvider):
             yield StreamError(stage=exc.stage, detail=exc.detail)
             return
         self._log_usage("chat_stream", data.get("usage"), started)
+        if tool_calls and not offered:
+            if not content:
+                detail = _unoffered_tool_detail(url, [call.name for call in tool_calls])
+                yield _UnofferedToolCall(StreamError(stage="openai_compat_empty", detail=detail))
+                return
+            tool_calls = ()
         if not content and not tool_calls:
             yield StreamError(stage="openai_compat_empty", detail=f"empty reply from {url}")
             return
@@ -582,6 +605,7 @@ class OpenAICompatProvider(LLMProvider):
         options: dict[str, Any] | None,
         *,
         stream: bool,
+        reminder: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self._model,
@@ -598,6 +622,8 @@ class OpenAICompatProvider(LLMProvider):
             payload["tools"] = tools
         if stream:
             payload["stream_options"] = {"include_usage": True}
+        if reminder:
+            payload["messages"].append({"role": "user", "content": _NO_TOOLS_REMINDER})
         return payload
 
     def _complete(
@@ -609,14 +635,21 @@ class OpenAICompatProvider(LLMProvider):
         call_type: str,
     ) -> ChatResponse:
         started = time.monotonic()
-        payload = self._payload(messages, tools, options, stream=False)
         try:
-            try:
-                data = self._post(payload)
-            except _TransientHTTPError as exc:
-                self._pause_before_retry(exc.detail)
-                data = self._post(payload)
+            data = self._post_retrying(self._payload(messages, tools, options, stream=False))
             content, tool_calls = _completion_parts(data)
+            if tool_calls and not tools:
+                if not content:
+                    detail = _unoffered_tool_detail(
+                        self._url("/chat/completions"), [call.name for call in tool_calls]
+                    )
+                    self._log_reminder_retry(detail)
+                    payload = self._payload(messages, tools, options, stream=False, reminder=True)
+                    data = self._post_retrying(payload)
+                    content, tool_calls = _completion_parts(data)
+                    if tool_calls and not content:
+                        raise ProviderError("openai_compat_empty", detail)
+                tool_calls = ()
         except ProviderError as exc:
             safe = _safe_detail(exc.detail, self._api_key)
             if safe == exc.detail:
@@ -624,6 +657,18 @@ class OpenAICompatProvider(LLMProvider):
             raise ProviderError(exc.stage, safe) from None
         self._log_usage(call_type, data.get("usage"), started)
         return ChatResponse(content=content, tool_calls=tool_calls, raw=data)
+
+    def _log_reminder_retry(self, detail: str) -> None:
+        logger.warning(
+            "openai_compat: %s; asking once more for words", _safe_detail(detail, self._api_key)
+        )
+
+    def _post_retrying(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._post(payload)
+        except _TransientHTTPError as exc:
+            self._pause_before_retry(exc.detail)
+            return self._post(payload)
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = self._url("/chat/completions")
@@ -716,6 +761,24 @@ class _Transient:
     """Wraps a StreamError worth one retry; unwrapped by ``chat_stream``."""
 
     error: StreamError
+
+
+class _UnofferedToolCall(_Transient):
+    """A reply that was only a tool call on a request offering no tools; retried
+    once with ``_NO_TOOLS_REMINDER``."""
+
+
+# A request that offers no tools wants words (run_tool_loop's forced last pass,
+# generate()), yet some models still answer it with a tool call only — often the
+# monologue call the persona's voice.md asks for first. Nothing can run that
+# call, so it is dropped; when it was the whole reply, the request is sent once
+# more with this note as a trailing user message. Appended to the earlier user
+# message instead, it sits before the tool results and the model often ignores it.
+_NO_TOOLS_REMINDER = "(No tools are available for this reply. Answer in words now.)"
+
+
+def _unoffered_tool_detail(url: str, names: list[str]) -> str:
+    return f"empty reply from {url}: the model asked for a tool ({', '.join(names)}) that was not offered"
 
 
 def _retryable_status(status: object) -> bool:
