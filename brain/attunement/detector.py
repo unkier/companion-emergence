@@ -79,26 +79,35 @@ def _call_haiku(
     *,
     persona_dir: Path | None = None,
 ) -> str:
-    """Call Haiku via the Claude CLI. Returns raw stdout (expected JSON).
+    """Call the attunement-detector model. Returns raw text (expected JSON).
 
-    Routes through ClaudeCliProvider.generate() which uses
-    --system-prompt-file with a tempfile to avoid the Windows CreateProcess
-    argv length cap (WinError 206 — see project gotchas list).
+    An openai-compat persona runs on its own tier provider. Everyone else keeps
+    the Claude CLI path: ClaudeCliProvider.generate() uses --system-prompt-file
+    with a tempfile to avoid the Windows CreateProcess argv length cap
+    (WinError 206 — see project gotchas list).
 
     Returns empty string on any failure so callers can decline cleanly.
     """
-    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, model_for_tier
+    from brain.bridge.model_tier import (
+        TIER_ATTUNEMENT_DETECTOR,
+        build_tier_provider,
+        model_for_tier,
+        provider_kind,
+    )
     from brain.bridge.provider import ClaudeCliProvider
 
-    provider = ClaudeCliProvider(
-        model=model_for_tier(TIER_ATTUNEMENT_DETECTOR),
-        timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
-    )
     pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir
     try:
+        if pd is not None and provider_kind(pd) == "openai-compat":
+            tier_provider = build_tier_provider(pd, TIER_ATTUNEMENT_DETECTOR)
+            return tier_provider.generate(user_message, system=system_prompt)
+        provider = ClaudeCliProvider(
+            model=model_for_tier(TIER_ATTUNEMENT_DETECTOR),
+            timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
+        )
         return provider.generate(user_message, system=system_prompt, persona_dir=pd)
     except Exception as exc:  # noqa: BLE001
-        log.warning("attunement detector: claude CLI call failed: %s", exc)
+        log.warning("attunement detector: model call failed: %s", exc)
         if pd is not None:
             try:
                 import traceback as _tb

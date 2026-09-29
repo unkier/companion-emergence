@@ -39,7 +39,7 @@ DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 # rather than letting an invalid choice surface as a runtime crash at
 # bridge startup or heartbeat-close time. Keep these in sync with
 # brain/bridge/provider.py:get_provider and brain/search/factory.py.
-KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
+KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "openai-compat", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
 KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
 
@@ -92,6 +92,9 @@ class PersonaConfig:
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
     kindled_link_enabled: bool = False
     kindled_relay_url: str | None = None  # relay where this Kindled's mailbox lives; None = not wired
+    # openai-compat provider endpoint block, kept raw here and validated by
+    # brain.bridge.openai_compat.OpenAICompatSettings.from_config (loudly).
+    openai_compat: dict | None = None
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -165,6 +168,8 @@ class PersonaConfig:
             if isinstance(last_opened_at_raw, str) and last_opened_at_raw.strip()
             else None
         )
+        openai_compat_raw = data.get("openai_compat")
+        openai_compat = openai_compat_raw if isinstance(openai_compat_raw, dict) else None
         return cls(
             provider=provider,
             searcher=searcher,
@@ -177,6 +182,7 @@ class PersonaConfig:
             notes_folder=notes_folder,
             kindled_link_enabled=kindled_link_enabled,
             kindled_relay_url=kindled_relay_url,
+            openai_compat=openai_compat,
         )
 
     @classmethod
@@ -221,6 +227,10 @@ class PersonaConfig:
             "kindled_link_enabled": self.kindled_link_enabled,
             "kindled_relay_url": self.kindled_relay_url,
         }
+        # Only openai-compat personas carry the block; every other persona's
+        # file keeps its exact key set.
+        if self.openai_compat is not None:
+            payload["openai_compat"] = self.openai_compat
         treatment = compute_treatment(path.parent, path.name)
         save_with_backup(path, payload, backup_count=treatment.backup_count)
         if treatment.verify_after_write:

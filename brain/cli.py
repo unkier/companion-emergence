@@ -65,6 +65,20 @@ def _resolve_routing(persona_dir: Path, args: argparse.Namespace) -> tuple[str, 
     return provider, searcher
 
 
+def _cli_provider(provider_name: str, persona_dir: Path):
+    """The dev-CLI provider. Only openai-compat is persona-aware here.
+
+    claude-cli keeps its bare ``get_provider(name)`` call: passing persona_dir
+    would switch the dev CLI to the persona's chat model (see model_tier's
+    dev-cli note). openai-compat needs persona_dir to find its endpoint.
+    """
+    if provider_name == "openai-compat":
+        from brain.bridge.model_tier import TIER_DEV_CLI
+
+        return get_provider(provider_name, persona_dir=persona_dir, tier=TIER_DEV_CLI)
+    return get_provider(provider_name)
+
+
 def _resolve_persona_or_exit(arg: str | None) -> str:
     """Resolve the persona name for a CLI command.
 
@@ -774,6 +788,49 @@ def _works_read_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _provider_set_key_handler(args: argparse.Namespace) -> int:
+    """Prompt for the openai-compat API key and store it owner-only."""
+    import getpass
+
+    from brain.bridge.openai_compat import write_api_key
+    from brain.paths import get_persona_dir
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+    key = getpass.getpass("API key (leave empty to remove): ").strip()
+    path = write_api_key(persona_dir, key or None)
+    print(f"API key {'saved to' if key else 'removed from'} {path}")
+    return 0
+
+
+def _provider_check_handler(args: argparse.Namespace) -> int:
+    """Probe the persona's openai-compat endpoint and print PASS/FAIL per check."""
+    from brain.bridge import openai_compat_check
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT
+    from brain.bridge.openai_compat import build_openai_compat_provider
+    from brain.bridge.provider import ProviderError
+    from brain.paths import get_persona_dir
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+    try:
+        provider = build_openai_compat_provider(persona_dir, tier=TIER_INTERACTIVE_CHAT)
+    except ProviderError as exc:
+        print(f"config error: {exc.detail}", file=sys.stderr)
+        return 1
+    print(f"checking {provider.name()} at {provider.base_url}")
+    results = openai_compat_check.run_endpoint_check(provider)
+    for result in results:
+        mark = "PASS" if result.ok else "FAIL"
+        suffix = f" — {result.detail}" if result.detail else ""
+        print(f"[{mark}] {result.name}{suffix}")
+    return 0 if all(result.ok for result in results) else 1
+
+
 def _dream_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell dream` to the DreamEngine.
 
@@ -805,7 +862,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         try:
-            provider = get_provider(provider_name)
+            provider = _cli_provider(provider_name, persona_dir)
             engine = DreamEngine(
                 store=store,
                 hebbian=hebbian,
@@ -865,7 +922,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
-            provider = get_provider(provider_name)
+            provider = _cli_provider(provider_name, persona_dir)
             engine = HeartbeatEngine(
                 store=store,
                 hebbian=hebbian,
@@ -985,7 +1042,7 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        provider = get_provider(provider_name)
+        provider = _cli_provider(provider_name, persona_dir)
         engine = ReflexEngine(
             store=store,
             provider=provider,
@@ -1041,7 +1098,7 @@ def _research_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        provider = get_provider(provider_name)
+        provider = _cli_provider(provider_name, persona_dir)
         searcher = get_searcher(searcher_name)
         engine = ResearchEngine(
             store=store,
@@ -1727,7 +1784,7 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        provider = get_provider(provider_name)
+        provider = _cli_provider(provider_name, persona_dir)
 
         from brain.soul.review import review_pending_candidates
         from brain.soul.store import SoulStore
@@ -1956,7 +2013,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
-            provider = get_provider(provider_name)
+            provider = _cli_provider(provider_name, persona_dir)
 
             # One-shot mode
             message = getattr(args, "message", None)
@@ -2599,7 +2656,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default=None,
         help=(
-            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "(developer override) LLM provider — claude-cli, fake, ollama, openai-compat. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
@@ -2628,7 +2685,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default=None,
         help=(
-            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "(developer override) LLM provider — claude-cli, fake, ollama, openai-compat. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
@@ -2672,7 +2729,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default=None,
         help=(
-            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "(developer override) LLM provider — claude-cli, fake, ollama, openai-compat. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
@@ -2702,7 +2759,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default=None,
         help=(
-            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "(developer override) LLM provider — claude-cli, fake, ollama, openai-compat. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
@@ -2994,6 +3051,25 @@ def _build_parser() -> argparse.ArgumentParser:
     w_read.add_argument("--id", required=True)
     w_read.set_defaults(func=_works_read_handler)
 
+    # nell provider — key + live endpoint check for the openai-compat provider.
+    prov_sub = subparsers.add_parser(
+        "provider",
+        help="Configure and test the openai-compat LLM provider.",
+    )
+    prov_actions = prov_sub.add_subparsers(dest="action", required=True)
+
+    prov_set_key = prov_actions.add_parser(
+        "set-key", help="Store the endpoint API key (prompted, never echoed)."
+    )
+    prov_set_key.add_argument("--persona", required=True)
+    prov_set_key.set_defaults(func=_provider_set_key_handler)
+
+    prov_check = prov_actions.add_parser(
+        "check", help="Test the endpoint: reachable, chat, tool call, streaming."
+    )
+    prov_check.add_argument("--persona", required=True)
+    prov_check.set_defaults(func=_provider_check_handler)
+
     # nell growth log — read-only inspection of brain growth biography.
     # Per Phase 2a §8: only `log` action ships; no add/approve/reject/force.
     g_sub = subparsers.add_parser(
@@ -3163,7 +3239,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--provider",
         default=None,
         help=(
-            "(developer override) LLM provider — claude-cli, fake, ollama. "
+            "(developer override) LLM provider — claude-cli, fake, ollama, openai-compat. "
             "Defaults to the value in {persona}/persona_config.json."
         ),
     )
@@ -3221,7 +3297,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sl_review.add_argument(
         "--provider",
         default=None,
-        help="(developer override) LLM provider — claude-cli, fake, ollama.",
+        help="(developer override) LLM provider — claude-cli, fake, ollama, openai-compat.",
     )
     sl_review.set_defaults(func=_soul_review_handler)
 

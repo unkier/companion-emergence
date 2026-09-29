@@ -310,6 +310,7 @@ def run_backfill(
                     companion_name=_cname,
                     user_name=_uname,
                     user_pronouns=_upron,
+                    persona_dir=persona_dir,
                 )
         else:
             def detector_fn(*, buffer_slice, reply_text):  # noqa: ANN001
@@ -319,6 +320,7 @@ def run_backfill(
                     companion_name=_cname,
                     user_name=_uname,
                     user_pronouns=_upron,
+                    persona_dir=persona_dir,
                 )
 
     now_dt = now_dt or _datetime.now(UTC)

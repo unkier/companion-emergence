@@ -11,6 +11,7 @@ RTS — construction-only assertions: never calls .generate(), so no live
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -35,7 +36,9 @@ from brain.bridge.model_tier import (
     build_tier_provider,
     model_for_tier,
     model_label_for_provider,
+    provider_kind,
 )
+from brain.bridge.openai_compat import OpenAICompatProvider
 from brain.bridge.provider import ClaudeCliProvider
 
 
@@ -342,3 +345,42 @@ def test_no_site_hardcodes_a_literal_model_string_into_claude_cli_provider():
             if value_start.startswith(("'", '"')):
                 offenders.append(f"{path}: literal model= {value_start!r}")
     assert offenders == [], f"ClaudeCliProvider(model=<literal>) outside the accessor: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# openai-compat: tiers resolve to the persona's own per-tier models
+# ---------------------------------------------------------------------------
+
+
+def _openai_compat_persona(tmp_path: Path, tier_models: dict | None = None) -> Path:
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    block = {"base_url": "http://127.0.0.1:9/v1", "model": "main-model", "tier_models": tier_models or {}}
+    (persona_dir / "persona_config.json").write_text(
+        json.dumps({"provider": "openai-compat", "openai_compat": block})
+    )
+    return persona_dir
+
+
+def test_build_tier_provider_openai_compat_uses_the_tier_model(tmp_path):
+    persona_dir = _openai_compat_persona(tmp_path, {"compaction": "small-model"})
+    provider = build_tier_provider(persona_dir, TIER_COMPACTION)
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider._model == "small-model"
+
+
+def test_build_tier_provider_openai_compat_never_gets_a_claude_alias(tmp_path):
+    provider = build_tier_provider(_openai_compat_persona(tmp_path), TIER_BACKGROUND_CLASSIFIER)
+    assert provider._model == "main-model"
+
+
+def test_build_interactive_chat_provider_openai_compat_uses_the_interactive_tier(tmp_path):
+    persona_dir = _openai_compat_persona(tmp_path, {"interactive-chat": "chat-model"})
+    assert build_interactive_chat_provider(persona_dir)._model == "chat-model"
+
+
+def test_provider_kind_reads_persona_config(tmp_path):
+    assert provider_kind(_openai_compat_persona(tmp_path)) == "openai-compat"
+    other = tmp_path / "other"
+    other.mkdir()
+    assert provider_kind(other) == "claude-cli"

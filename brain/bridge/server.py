@@ -55,6 +55,8 @@ from brain.bridge.chat import (
     StreamDone,
     StreamError,
     TextDelta,
+    ToolCall,
+    ToolCallEvent,
 )
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
@@ -295,6 +297,11 @@ class _StreamingProxy:
     If the real provider does not implement chat_stream() (e.g. OllamaProvider,
     FakeProvider), chat() falls back to the real provider's chat() unchanged and
     no chunks are forwarded (the None sentinel is still sent so the WS loop exits).
+
+    Providers that hand tool calls back to run_tool_loop (openai-compat) stream
+    them as ToolCallEvents; they are collected into ChatResponse.tool_calls so
+    the loop dispatches them. The Claude CLI runs its tools in-process and never
+    yields ToolCallEvent, so its path is unchanged.
     """
 
     def __init__(
@@ -365,13 +372,28 @@ class _StreamingProxy:
             return resp
 
         chunks: list[str] = []
+        tool_calls: list[ToolCall] = []
+        final_content: str | None = None
         for ev in chat_stream(messages, tools=tools, options=options):
             if isinstance(ev, TextDelta):
                 chunks.append(ev.text)
                 if not suppress:
                     self._loop.call_soon_threadsafe(self._q.put_nowait, ev.text)
+            elif isinstance(ev, ToolCallEvent):
+                tool_calls.append(
+                    ToolCall(
+                        id=ev.id or f"call_{len(tool_calls)}",
+                        name=ev.name,
+                        arguments=ev.arguments,
+                    )
+                )
             elif isinstance(ev, StreamDone):
-                if ev.content and not chunks:
+                if ev.metadata.get("authoritative_content"):
+                    # The provider cleaned the finished reply (openai-compat:
+                    # reasoning and role-leak stripping). Text already streamed
+                    # can't be recalled, but the loop emits and saves this one.
+                    final_content = ev.content
+                elif ev.content and not chunks:
                     # No per-token deltas arrived (result-frame-only path
                     # or EOF assistant-snapshot fallback). Queue the
                     # content so the WS still emits at least one
@@ -394,8 +416,8 @@ class _StreamingProxy:
             )
 
         return ChatResponse(
-            content="".join(chunks),
-            tool_calls=(),
+            content="".join(chunks) if final_content is None else final_content,
+            tool_calls=tuple(tool_calls),
             raw=None,
             dispatched_invocations=dispatched,
         )
@@ -1728,11 +1750,22 @@ def build_app(
 
         Returns: {ok: true, model: <new_model>}
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+                 409 {ok: false, error: "model_managed_in_config"} — openai-compat persona
         """
         from dataclasses import replace as dc_replace
 
         from brain.persona_config import KNOWN_MODELS, PersonaConfig
 
+        s: BridgeAppState = app.state.bridge
+        config_path = s.persona_dir / "persona_config.json"
+        current = PersonaConfig.load(config_path)
+        if current.provider == "openai-compat":
+            # Its models live per tier in the openai_compat block; this route only
+            # knows Claude aliases, so writing one here would silently be wrong.
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "error": "model_managed_in_config"},
+            )
         if req.model not in KNOWN_MODELS:
             return JSONResponse(
                 status_code=400,
@@ -1742,9 +1775,6 @@ def build_app(
                     "valid": sorted(KNOWN_MODELS),
                 },
             )
-        s: BridgeAppState = app.state.bridge
-        config_path = s.persona_dir / "persona_config.json"
-        current = PersonaConfig.load(config_path)
         updated = dc_replace(current, model=req.model)
         updated.save(config_path)
         # Hot-swap: if the live provider exposes _model, update it so the

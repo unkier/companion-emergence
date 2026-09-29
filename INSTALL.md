@@ -204,6 +204,13 @@ launch without warnings.
 
 ---
 
+## Using a non-Claude model
+
+To run a Kindled on a local model server or another hosted API instead of
+Claude, see [docs/openai-compat-provider.md](docs/openai-compat-provider.md).
+
+---
+
 ## Verifying the binary
 
 If you want to confirm what you downloaded matches what we shipped,
